@@ -442,9 +442,8 @@ function createServer(): McpServer {
 
 // ── HTTP Server (stateless mode) ───────────────────────────
 
-// Single server instance — reused across all requests
-const mcpServer = createServer();
-
+// Per the MCP SDK stateless pattern, a new server instance is created per
+// request so that .connect() is only called once per McpServer lifetime.
 const httpServer = Bun.serve({
   port: PORT,
   hostname: "0.0.0.0",
@@ -459,10 +458,11 @@ const httpServer = Bun.serve({
     }
 
     if (url.pathname === "/mcp") {
+      const server = createServer();
       const transport = new WebStandardStreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
       });
-      await mcpServer.connect(transport);
+      await server.connect(transport);
       return transport.handleRequest(req);
     }
 

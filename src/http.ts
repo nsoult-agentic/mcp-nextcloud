@@ -44,8 +44,8 @@ function loadCredentials(): Credentials {
 let creds: Credentials;
 try {
   creds = loadCredentials();
-} catch (e) {
-  console.error("Failed to load credentials:", (e as Error).message);
+} catch {
+  console.error("Failed to load credentials — check /secrets/credentials.json exists and is valid JSON");
   process.exit(1);
 }
 
@@ -55,9 +55,19 @@ const AUTH_HEADER = `Basic ${btoa(`${creds.username}:${creds.password}`)}`;
 // ── Path Validation ────────────────────────────────────────
 
 function validatePath(p: string): string | null {
-  if (p.includes("..")) return "Path traversal (..) not allowed";
-  if (p.includes("\\")) return "Backslashes not allowed";
   if (p.length > 500) return "Path too long (max 500 chars)";
+  // Decode URL-encoded characters before validation to catch %2e%2e bypasses
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(p);
+  } catch {
+    return "Invalid path encoding";
+  }
+  if (decoded.includes("..")) return "Path traversal (..) not allowed";
+  if (decoded.includes("\\")) return "Backslashes not allowed";
+  if (/[\x00-\x1f]/.test(decoded)) return "Control characters not allowed";
+  if (p.includes("%00") || p.includes("\x00")) return "Null bytes not allowed";
+  if (/[?#@]/.test(p)) return "Path contains invalid characters";
   return null;
 }
 
@@ -141,6 +151,13 @@ function parseMultistatus(xml: string, basePath: string): DavEntry[] {
   }
 
   return entries;
+}
+
+// ── Output Sanitization ───────────────────────────────────
+
+/** Strip markdown-active and control characters from untrusted strings in tool output */
+function sanitizeOutput(s: string): string {
+  return s.replace(/[|[\](){}#*_~`<>!\x00-\x1f]/g, "_").slice(0, 255);
 }
 
 // ── Formatting ─────────────────────────────────────────────
@@ -238,6 +255,8 @@ async function list(params: { path: string }): Promise<string> {
     if (!res.ok && res.status !== 207) return `List failed (${res.status})`;
 
     const xml = await res.text();
+    if (xml.length > 2_000_000)
+      return "Response too large — directory has too many items. Use a more specific path.";
     const userPath = `/remote.php/dav/files/${encodeURIComponent(creds.username)}${normalizePath(params.path)}`;
     const entries = parseMultistatus(xml, userPath);
 
@@ -255,7 +274,7 @@ async function list(params: { path: string }): Promise<string> {
     for (const e of entries) {
       const icon = e.isDir ? "dir" : "file";
       lines.push(
-        `| [${icon}] ${e.name} | ${fmtSize(e.size)} | ${fmtDate(e.modified)} | ${e.contentType} |`,
+        `| [${icon}] ${sanitizeOutput(e.name)} | ${fmtSize(e.size)} | ${fmtDate(e.modified)} | ${sanitizeOutput(e.contentType)} |`,
       );
     }
 
@@ -329,7 +348,8 @@ async function search(params: {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
 
   const body = `<?xml version="1.0" encoding="UTF-8"?>
 <oc:filter-files xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">
@@ -360,13 +380,14 @@ async function search(params: {
     if (!res.ok && res.status !== 207) return `Search failed (${res.status})`;
 
     const xml = await res.text();
+    if (xml.length > 2_000_000)
+      return "Response too large — too many search results. Use a more specific query.";
     // Empty basePath for search — no self-entry to skip
     const entries = parseMultistatus(xml, "");
 
     if (entries.length === 0) return `No files matching "${params.query}" found.`;
 
     const limited = entries.slice(0, params.limit);
-    const davPrefix = `/remote.php/dav/files/${encodeURIComponent(creds.username)}/`;
 
     const lines = [`## Search: "${params.query}"`, ""];
     lines.push("| Path | Size | Modified | Type |");
@@ -374,11 +395,10 @@ async function search(params: {
 
     for (const e of limited) {
       const icon = e.isDir ? "dir" : "file";
-      const relPath = e.href.includes(davPrefix)
-        ? e.href.split(davPrefix)[1] || e.name
-        : e.name;
+      // Strip WebDAV prefix without using credentials — use regex for safety
+      const relPath = e.href.replace(/^.*\/remote\.php\/dav\/files\/[^/]+\//, "") || e.name;
       lines.push(
-        `| [${icon}] ${relPath} | ${fmtSize(e.size)} | ${fmtDate(e.modified)} | ${e.contentType} |`,
+        `| [${icon}] ${sanitizeOutput(relPath)} | ${fmtSize(e.size)} | ${fmtDate(e.modified)} | ${sanitizeOutput(e.contentType)} |`,
       );
     }
 

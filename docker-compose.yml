@@ -36,7 +36,7 @@ services:
       # Secrets — root-owned on host, read-only in container
       - /srv/mcp-nextcloud/secrets:/secrets:ro
     tmpfs:
-      - /tmp:size=64m
+      - /tmp:size=64m,noexec,nosuid
 
     # ── Health Check ──
     healthcheck:

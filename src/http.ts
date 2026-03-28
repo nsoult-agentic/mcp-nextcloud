@@ -460,6 +460,22 @@ function createServer(): McpServer {
   return server;
 }
 
+// ── Rate Limiter ──────────────────────────────────────────
+
+const RATE_LIMIT = 30;
+const RATE_WINDOW_MS = 60_000;
+const requestTimestamps: number[] = [];
+
+function isRateLimited(): boolean {
+  const now = Date.now();
+  while (requestTimestamps.length > 0 && requestTimestamps[0] < now - RATE_WINDOW_MS) {
+    requestTimestamps.shift();
+  }
+  if (requestTimestamps.length >= RATE_LIMIT) return true;
+  requestTimestamps.push(now);
+  return false;
+}
+
 // ── HTTP Server (stateless mode) ───────────────────────────
 
 // Per the MCP SDK stateless pattern, a new server instance is created per
@@ -478,6 +494,9 @@ const httpServer = Bun.serve({
     }
 
     if (url.pathname === "/mcp") {
+      if (isRateLimited()) {
+        return new Response("Rate limit exceeded", { status: 429 });
+      }
       const server = createServer();
       const transport = new WebStandardStreamableHTTPServerTransport({
         sessionIdGenerator: undefined,

@@ -305,7 +305,12 @@ async function mkdir(params: { path: string }): Promise<string> {
   try {
     const res = await webdav("MKCOL", params.path);
 
-    if (res.status === 201) return `Created directory: ${params.path}`;
+    if (res.status === 201) {
+      // PROPFIND forces NextCloud to register the folder in oc_filecache.
+      // Without this, the OCS Share API returns 403 on newly created paths.
+      try { await webdav("PROPFIND", params.path, { Depth: "0" }); } catch {}
+      return `Created directory: ${params.path}`;
+    }
     if (res.status === 405) return `Directory already exists: ${params.path}`;
     if (res.status === 409)
       return "Error: Parent directory does not exist. Create parent directories first.";

@@ -7,6 +7,9 @@
  *   nextcloud-list    — List files/folders in a path via WebDAV PROPFIND
  *   nextcloud-mkdir   — Create a directory via WebDAV MKCOL
  *   nextcloud-search  — Search files by name via WebDAV REPORT
+ *   nextcloud-share   — Share a file/folder with a user via OCS Share API
+ *   nextcloud-move    — Move/rename a file or folder via WebDAV MOVE
+ *   nextcloud-delete  — Delete a file or folder via WebDAV DELETE
  *
  * SECURITY: Credentials read from /secrets/credentials.json (mounted from /srv/).
  * Credentials never appear in tool output. Generic error messages only.
@@ -413,6 +416,157 @@ async function search(params: {
   }
 }
 
+// ── OCS API Helper (for Share API) ────────────────────────
+
+const OCS_BASE = `${creds.server.replace(/\/+$/, "")}/ocs/v2.php/apps/files_sharing/api/v1`;
+
+async function ocsPost(
+  endpoint: string,
+  body: Record<string, string | number>,
+): Promise<{ status: number; data: any }> {
+  const res = await fetch(`${OCS_BASE}${endpoint}`, {
+    method: "POST",
+    headers: {
+      Authorization: AUTH_HEADER,
+      "OCS-APIRequest": "true",
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "application/json",
+    },
+    body: new URLSearchParams(
+      Object.entries(body).map(([k, v]) => [k, String(v)]),
+    ),
+    signal: AbortSignal.timeout(15_000),
+  });
+  const json = await res.json();
+  return { status: res.status, data: json?.ocs?.data ?? json };
+}
+
+// ── Tool: nextcloud-share ─────────────────────────────────
+
+const ShareInput = {
+  path: z
+    .string()
+    .min(1)
+    .max(500)
+    .describe("Path to the file or folder to share (e.g., 'Shared/Accounting')"),
+  shareWith: z
+    .string()
+    .min(1)
+    .max(100)
+    .describe("NextCloud username to share with (e.g., 'admin')"),
+  permissions: z
+    .enum(["read", "read-write", "all"])
+    .default("read-write")
+    .describe("Permission level: 'read' (view only), 'read-write' (edit), 'all' (edit + reshare + delete)"),
+};
+
+async function share(params: {
+  path: string;
+  shareWith: string;
+  permissions: string;
+}): Promise<string> {
+  const err = validatePath(params.path);
+  if (err) return `Error: ${err}`;
+
+  // Map permission strings to NextCloud OCS permission integers
+  // 1=read, 2=update, 4=create, 8=delete, 16=reshare
+  const permMap: Record<string, number> = {
+    "read": 1,
+    "read-write": 1 + 2 + 4,     // read + update + create
+    "all": 1 + 2 + 4 + 8 + 16,   // read + update + create + delete + reshare
+  };
+
+  const permInt = permMap[params.permissions] ?? 7;
+
+  try {
+    const { status, data } = await ocsPost("/shares", {
+      path: normalizePath(params.path),
+      shareType: 0, // 0 = user share
+      shareWith: params.shareWith,
+      permissions: permInt,
+    });
+
+    if (status === 200) {
+      const shareId = data?.id ?? "unknown";
+      return `Shared "${params.path}" with ${params.shareWith} (${params.permissions}). Share ID: ${shareId}`;
+    }
+    if (status === 404) return `Error: Path not found — "${params.path}"`;
+    if (status === 403) return `Error: Insufficient permissions to share this path.`;
+
+    const msg = data?.message || data?.meta?.message || "";
+    if (msg) return `Share failed (${status}): ${sanitizeOutput(msg)}`;
+    return `Share failed (${status})`;
+  } catch {
+    return "Share failed — NextCloud request error.";
+  }
+}
+
+// ── Tool: nextcloud-move ──────────────────────────────────
+
+const MoveInput = {
+  from: z
+    .string()
+    .min(1)
+    .max(500)
+    .describe("Source path (e.g., 'Shared/old-name.pdf')"),
+  to: z
+    .string()
+    .min(1)
+    .max(500)
+    .describe("Destination path (e.g., 'Shared/Accounting/Invoices/invoice.pdf')"),
+};
+
+async function move(params: { from: string; to: string }): Promise<string> {
+  const fromErr = validatePath(params.from);
+  if (fromErr) return `Error (from): ${fromErr}`;
+  const toErr = validatePath(params.to);
+  if (toErr) return `Error (to): ${toErr}`;
+
+  const destUrl = `${WEBDAV_BASE}${normalizePath(params.to)}`;
+
+  try {
+    const res = await webdav("MOVE", params.from, {
+      Destination: destUrl,
+      Overwrite: "F", // Don't overwrite existing files
+    });
+
+    if (res.status === 201) return `Moved: "${params.from}" → "${params.to}"`;
+    if (res.status === 204) return `Moved: "${params.from}" → "${params.to}" (replaced existing)`;
+    if (res.status === 404) return `Error: Source not found — "${params.from}"`;
+    if (res.status === 409) return `Error: Destination parent directory does not exist.`;
+    if (res.status === 412) return `Error: Destination already exists. Use a different name or delete it first.`;
+    return `Move failed (${res.status})`;
+  } catch {
+    return "Move failed — NextCloud request error.";
+  }
+}
+
+// ── Tool: nextcloud-delete ────────────────────────────────
+
+const DeleteInput = {
+  path: z
+    .string()
+    .min(1)
+    .max(500)
+    .describe("Path to the file or folder to delete (e.g., 'Shared/test-folder')"),
+};
+
+async function del(params: { path: string }): Promise<string> {
+  const err = validatePath(params.path);
+  if (err) return `Error: ${err}`;
+
+  try {
+    const res = await webdav("DELETE", params.path);
+
+    if (res.status === 204) return `Deleted: "${params.path}"`;
+    if (res.status === 404) return `Error: Not found — "${params.path}"`;
+    if (res.status === 403) return `Error: Insufficient permissions to delete this path.`;
+    return `Delete failed (${res.status})`;
+  } catch {
+    return "Delete failed — NextCloud request error.";
+  }
+}
+
 // ── MCP Server ─────────────────────────────────────────────
 
 function createServer(): McpServer {
@@ -454,6 +608,33 @@ function createServer(): McpServer {
     SearchInput,
     async (params) => ({
       content: [{ type: "text" as const, text: await search(params) }],
+    }),
+  );
+
+  server.tool(
+    "nextcloud-share",
+    "Share a file or folder with a NextCloud user. Sets permissions (read, read-write, or all).",
+    ShareInput,
+    async (params) => ({
+      content: [{ type: "text" as const, text: await share(params) }],
+    }),
+  );
+
+  server.tool(
+    "nextcloud-move",
+    "Move or rename a file/folder on NextCloud. Destination parent must exist.",
+    MoveInput,
+    async (params) => ({
+      content: [{ type: "text" as const, text: await move(params) }],
+    }),
+  );
+
+  server.tool(
+    "nextcloud-delete",
+    "Delete a file or folder on NextCloud. Use with caution — deletion is permanent.",
+    DeleteInput,
+    async (params) => ({
+      content: [{ type: "text" as const, text: await del(params) }],
     }),
   );
 
@@ -510,7 +691,7 @@ const httpServer = Bun.serve({
 });
 
 console.log(`mcp-nextcloud listening on http://0.0.0.0:${PORT}/mcp`);
-console.log("Tools: 4 | NextCloud: connected");
+console.log("Tools: 7 | NextCloud: connected");
 
 process.on("SIGTERM", () => {
   httpServer.stop();

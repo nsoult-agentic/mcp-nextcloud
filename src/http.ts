@@ -159,9 +159,9 @@ function parseMultistatus(xml: string, basePath: string): DavEntry[] {
 
 // ── Output Sanitization ───────────────────────────────────
 
-/** Strip markdown-active and control characters from untrusted strings in tool output */
+/** Strip markdown-active, control characters, and newlines from untrusted strings in tool output */
 function sanitizeOutput(s: string): string {
-  return s.replace(/[|[\](){}#*_~`<>!\x00-\x1f]/g, "_").slice(0, 255);
+  return s.replace(/[|[\](){}#*_~`<>!\x00-\x1f\r\n]/g, "_").slice(0, 255);
 }
 
 // ── Formatting ─────────────────────────────────────────────
@@ -537,7 +537,7 @@ async function move(params: { from: string; to: string }): Promise<string> {
     });
 
     if (res.status === 201) return `Moved: "${params.from}" → "${params.to}"`;
-    if (res.status === 204) return `Moved: "${params.from}" → "${params.to}" (replaced existing)`;
+    if (res.status === 204) return `Moved: "${params.from}" → "${params.to}"`;
     if (res.status === 404) return `Error: Source not found — "${params.from}"`;
     if (res.status === 409) return `Error: Destination parent directory does not exist.`;
     if (res.status === 412) return `Error: Destination already exists. Use a different name or delete it first.`;
@@ -631,14 +631,9 @@ async function download(params: { path: string }): Promise<{
   }
 
   // Binary files (PDF, images, docx, etc.) — return base64
-  const bytes = new Uint8Array(buffer);
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
   return {
     type: "base64",
-    content: btoa(binary),
+    content: Buffer.from(buffer).toString("base64"),
     mimeType,
     size: buffer.byteLength,
   };
@@ -732,7 +727,7 @@ function createServer(): McpServer {
           content: [{
             type: "resource" as const,
             resource: {
-              uri: `nextcloud://${normalizePath(params.path)}`,
+              uri: `nextcloud://${encodeURI(normalizePath(params.path))}`,
               mimeType: result.mimeType,
               blob: result.content,
             },
@@ -776,10 +771,19 @@ const httpServer = Bun.serve({
     const url = new URL(req.url);
 
     if (url.pathname === "/health") {
-      return new Response(
-        JSON.stringify({ status: "ok", service: "mcp-nextcloud" }),
-        { headers: { "Content-Type": "application/json" } },
-      );
+      try {
+        const check = await webdav("PROPFIND", "/", { Depth: "0" });
+        const ok = check.status === 207 || check.ok;
+        return new Response(
+          JSON.stringify({ status: ok ? "ok" : "degraded", service: "mcp-nextcloud", nextcloud: ok }),
+          { status: ok ? 200 : 503, headers: { "Content-Type": "application/json" } },
+        );
+      } catch {
+        return new Response(
+          JSON.stringify({ status: "degraded", service: "mcp-nextcloud", nextcloud: false }),
+          { status: 503, headers: { "Content-Type": "application/json" } },
+        );
+      }
     }
 
     if (url.pathname === "/mcp") {

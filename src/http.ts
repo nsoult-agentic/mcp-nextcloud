@@ -9,7 +9,8 @@
  *   nextcloud-search  — Search files by name via WebDAV REPORT
  *   nextcloud-share   — Share a file/folder with a user via OCS Share API
  *   nextcloud-move    — Move/rename a file or folder via WebDAV MOVE
- *   nextcloud-delete  — Delete a file or folder via WebDAV DELETE
+ *   nextcloud-delete    — Delete a file or folder via WebDAV DELETE
+ *   nextcloud-download  — Download file content via WebDAV GET (text or base64)
  *
  * SECURITY: Credentials read from /secrets/credentials.json (mounted from /srv/).
  * Credentials never appear in tool output. Generic error messages only.
@@ -572,6 +573,77 @@ async function del(params: { path: string }): Promise<string> {
   }
 }
 
+// ── Tool: nextcloud-download ─────────────────────────────
+
+const DownloadInput = {
+  path: z
+    .string()
+    .min(1)
+    .max(500)
+    .describe("Path to the file to download (e.g., 'Shared/Accounting/Invoices/2026/invoice.pdf')"),
+};
+
+const MAX_DOWNLOAD_SIZE = 10 * 1024 * 1024; // 10MB
+
+const TEXT_EXTENSIONS = new Set([
+  "txt", "md", "csv", "json", "xml", "html", "htm", "yaml", "yml",
+  "toml", "ini", "cfg", "conf", "log", "sh", "bash", "ts", "js",
+  "py", "rb", "go", "rs", "java", "c", "h", "cpp", "css", "sql",
+]);
+
+async function download(params: { path: string }): Promise<{
+  type: "text" | "base64";
+  content: string;
+  mimeType: string;
+  size: number;
+}> {
+  const err = validatePath(params.path);
+  if (err) throw new Error(err);
+
+  const res = await webdav("GET", params.path);
+
+  if (res.status === 404) throw new Error(`File not found: "${params.path}"`);
+  if (res.status === 403) throw new Error("Insufficient permissions to read this file.");
+  if (!res.ok) throw new Error(`Download failed (${res.status})`);
+
+  const contentLength = Number(res.headers.get("content-length") || 0);
+  if (contentLength > MAX_DOWNLOAD_SIZE) {
+    throw new Error(`File too large (${(contentLength / 1024 / 1024).toFixed(1)}MB). Max: 10MB.`);
+  }
+
+  const mimeType = res.headers.get("content-type") || "application/octet-stream";
+  const ext = params.path.split(".").pop()?.toLowerCase() || "";
+  const isText = TEXT_EXTENSIONS.has(ext) || mimeType.startsWith("text/");
+
+  const buffer = await res.arrayBuffer();
+
+  if (buffer.byteLength > MAX_DOWNLOAD_SIZE) {
+    throw new Error(`File too large (${(buffer.byteLength / 1024 / 1024).toFixed(1)}MB). Max: 10MB.`);
+  }
+
+  if (isText) {
+    return {
+      type: "text",
+      content: new TextDecoder().decode(buffer),
+      mimeType,
+      size: buffer.byteLength,
+    };
+  }
+
+  // Binary files (PDF, images, docx, etc.) — return base64
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return {
+    type: "base64",
+    content: btoa(binary),
+    mimeType,
+    size: buffer.byteLength,
+  };
+}
+
 // ── MCP Server ─────────────────────────────────────────────
 
 function createServer(): McpServer {
@@ -643,6 +715,37 @@ function createServer(): McpServer {
     }),
   );
 
+  server.tool(
+    "nextcloud-download",
+    "Download a file from NextCloud. Returns text content for text files, base64 for binary files (PDF, images, etc.). Max 10MB.",
+    DownloadInput,
+    async (params) => {
+      try {
+        const result = await download(params);
+        if (result.type === "text") {
+          return {
+            content: [{ type: "text" as const, text: result.content }],
+          };
+        }
+        // Binary — return as embedded resource with base64
+        return {
+          content: [{
+            type: "resource" as const,
+            resource: {
+              uri: `nextcloud://${normalizePath(params.path)}`,
+              mimeType: result.mimeType,
+              blob: result.content,
+            },
+          }],
+        };
+      } catch (e) {
+        return {
+          content: [{ type: "text" as const, text: `Error: ${(e as Error).message}` }],
+        };
+      }
+    },
+  );
+
   return server;
 }
 
@@ -696,7 +799,7 @@ const httpServer = Bun.serve({
 });
 
 console.log(`mcp-nextcloud listening on http://0.0.0.0:${PORT}/mcp`);
-console.log("Tools: 7 | NextCloud: connected");
+console.log("Tools: 8 | NextCloud: connected");
 
 process.on("SIGTERM", () => {
   httpServer.stop();

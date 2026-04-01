@@ -9,7 +9,7 @@
 
 services:
   mcp-nextcloud:
-    image: ghcr.io/nsoult-agentic/mcp-nextcloud:sha-7221185
+    image: ghcr.io/nsoult-agentic/mcp-nextcloud:sha-a2ae8e2
     container_name: mcp-nextcloud
     restart: unless-stopped
 

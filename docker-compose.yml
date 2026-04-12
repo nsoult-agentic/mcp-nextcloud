@@ -14,6 +14,8 @@ services:
     restart: unless-stopped
 
     # ── Network ──
+    networks:
+      - mcp_network
     ports:
       - "127.0.0.1:8902:8902"  # Loopback ONLY — no external access
 
@@ -52,3 +54,7 @@ services:
       - SECRETS_DIR=/secrets
       - PORT=8902
       # NEVER put credentials here — read from /secrets/credentials.json
+
+networks:
+  mcp_network:
+    external: true

@@ -583,7 +583,7 @@ const DownloadInput = {
     .describe("Path to the file to download (e.g., 'Shared/Accounting/Invoices/2026/invoice.pdf')"),
 };
 
-const MAX_DOWNLOAD_SIZE = 10 * 1024 * 1024; // 10MB
+const MAX_DOWNLOAD_SIZE = 25 * 1024 * 1024; // 25MB
 
 const TEXT_EXTENSIONS = new Set([
   "txt", "md", "csv", "json", "xml", "html", "htm", "yaml", "yml",
@@ -608,7 +608,7 @@ async function download(params: { path: string }): Promise<{
 
   const contentLength = Number(res.headers.get("content-length") || 0);
   if (contentLength > MAX_DOWNLOAD_SIZE) {
-    throw new Error(`File too large (${(contentLength / 1024 / 1024).toFixed(1)}MB). Max: 10MB.`);
+    throw new Error(`File too large (${(contentLength / 1024 / 1024).toFixed(1)}MB). Max: ${MAX_DOWNLOAD_SIZE / 1024 / 1024}MB.`);
   }
 
   const mimeType = res.headers.get("content-type") || "application/octet-stream";
@@ -618,7 +618,7 @@ async function download(params: { path: string }): Promise<{
   const buffer = await res.arrayBuffer();
 
   if (buffer.byteLength > MAX_DOWNLOAD_SIZE) {
-    throw new Error(`File too large (${(buffer.byteLength / 1024 / 1024).toFixed(1)}MB). Max: 10MB.`);
+    throw new Error(`File too large (${(buffer.byteLength / 1024 / 1024).toFixed(1)}MB). Max: ${MAX_DOWNLOAD_SIZE / 1024 / 1024}MB.`);
   }
 
   if (isText) {
@@ -712,7 +712,7 @@ function createServer(): McpServer {
 
   server.tool(
     "nextcloud-download",
-    "Download a file from NextCloud. Returns text content for text files, base64 for binary files (PDF, images, etc.). Max 10MB.",
+    "Download a file from NextCloud. Returns text content for text files, base64 for binary files (PDF, images, etc.). Max 25MB.",
     DownloadInput,
     async (params) => {
       try {

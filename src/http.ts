@@ -9,6 +9,7 @@
  *   nextcloud-search  — Search files by name via WebDAV REPORT
  *   nextcloud-share   — Share a file/folder with a user via OCS Share API
  *   nextcloud-move    — Move/rename a file or folder via WebDAV MOVE
+ *   nextcloud-copy    — Copy a file or folder via WebDAV COPY (server-side, no data transfer)
  *   nextcloud-delete    — Delete a file or folder via WebDAV DELETE
  *   nextcloud-download  — Download file content via WebDAV GET (text or base64)
  *
@@ -547,6 +548,46 @@ async function move(params: { from: string; to: string }): Promise<string> {
   }
 }
 
+// ── Tool: nextcloud-copy ──────────────────────────────────
+
+const CopyInput = {
+  from: z
+    .string()
+    .min(1)
+    .max(500)
+    .describe("Source path (e.g., 'Shared/document.pdf')"),
+  to: z
+    .string()
+    .min(1)
+    .max(500)
+    .describe("Destination path (e.g., 'Shared/Archive/document.pdf')"),
+};
+
+async function copy(params: { from: string; to: string }): Promise<string> {
+  const fromErr = validatePath(params.from);
+  if (fromErr) return `Error (from): ${fromErr}`;
+  const toErr = validatePath(params.to);
+  if (toErr) return `Error (to): ${toErr}`;
+
+  const destUrl = `${WEBDAV_BASE}${normalizePath(params.to)}`;
+
+  try {
+    const res = await webdav("COPY", params.from, {
+      Destination: destUrl,
+      Overwrite: "F", // Don't overwrite existing files
+    });
+
+    if (res.status === 201) return `Copied: "${params.from}" → "${params.to}"`;
+    if (res.status === 204) return `Copied: "${params.from}" → "${params.to}" (overwrote existing)`;
+    if (res.status === 404) return `Error: Source not found — "${params.from}"`;
+    if (res.status === 409) return `Error: Destination parent directory does not exist.`;
+    if (res.status === 412) return `Error: Destination already exists. Use a different name or delete it first.`;
+    return `Copy failed (${res.status})`;
+  } catch {
+    return "Copy failed — NextCloud request error.";
+  }
+}
+
 // ── Tool: nextcloud-delete ────────────────────────────────
 
 const DeleteInput = {
@@ -702,6 +743,15 @@ function createServer(): McpServer {
   );
 
   server.tool(
+    "nextcloud-copy",
+    "Copy a file or folder on NextCloud server-side via WebDAV COPY. No data transfer through the MCP — works for any file size.",
+    CopyInput,
+    async (params) => ({
+      content: [{ type: "text" as const, text: await copy(params) }],
+    }),
+  );
+
+  server.tool(
     "nextcloud-delete",
     "Delete a file or folder on NextCloud. Use with caution — deletion is permanent.",
     DeleteInput,
@@ -803,7 +853,7 @@ const httpServer = Bun.serve({
 });
 
 console.log(`mcp-nextcloud listening on http://0.0.0.0:${PORT}/mcp`);
-console.log("Tools: 8 | NextCloud: connected");
+console.log("Tools: 9 | NextCloud: connected");
 
 process.on("SIGTERM", () => {
   httpServer.stop();

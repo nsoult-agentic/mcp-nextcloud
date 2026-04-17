@@ -194,19 +194,27 @@ const UploadInput = {
     .describe("Destination path including filename (e.g., 'Documents/report.pdf')"),
   content: z
     .string()
-    .min(1)
     .max(10_000_000)
-    .describe("File content — plain text or base64-encoded binary (max ~7.5MB decoded)"),
+    .optional()
+    .describe("File content — plain text or base64-encoded binary (max ~7.5MB decoded). Required if local_path is not set."),
   encoding: z
     .enum(["text", "base64"])
     .default("text")
-    .describe("Content encoding: 'text' (default) or 'base64' for binary files"),
+    .describe("Content encoding: 'text' (default) or 'base64' for binary files. Ignored when local_path is used."),
+  local_path: z
+    .string()
+    .max(1000)
+    .optional()
+    .describe("Absolute path to a file on the server's local filesystem. The server reads the file directly — no base64 needed. Max 100MB."),
 };
+
+const MAX_LOCAL_UPLOAD_SIZE = 100 * 1024 * 1024; // 100MB
 
 async function upload(params: {
   path: string;
-  content: string;
+  content?: string;
   encoding: string;
+  local_path?: string;
 }): Promise<string> {
   const err = validatePath(params.path);
   if (err) return `Error: ${err}`;
@@ -214,16 +222,35 @@ async function upload(params: {
   let contentType = "application/octet-stream";
   let reqBody: BodyInit;
 
-  if (params.encoding === "base64") {
+  if (params.local_path) {
+    // Read file directly from local filesystem
+    const localPath = params.local_path;
+    if (localPath.includes("..")) return "Error: Path traversal (..) not allowed in local_path.";
+    if (!localPath.startsWith("/")) return "Error: local_path must be an absolute path.";
+
     try {
-      const binary = atob(params.content);
-      reqBody = new Blob([Uint8Array.from(binary, (c) => c.charCodeAt(0))]);
+      const file = Bun.file(localPath);
+      if (!await file.exists()) return `Error: Local file not found: ${localPath}`;
+      if (file.size > MAX_LOCAL_UPLOAD_SIZE) return `Error: File too large (${(file.size / 1024 / 1024).toFixed(1)}MB). Max: ${MAX_LOCAL_UPLOAD_SIZE / 1024 / 1024}MB.`;
+      reqBody = file;
+      contentType = file.type || "application/octet-stream";
     } catch {
-      return "Error: Invalid base64 content.";
+      return `Error: Failed to read local file: ${localPath}`;
+    }
+  } else if (params.content) {
+    if (params.encoding === "base64") {
+      try {
+        const binary = atob(params.content);
+        reqBody = new Blob([Uint8Array.from(binary, (c) => c.charCodeAt(0))]);
+      } catch {
+        return "Error: Invalid base64 content.";
+      }
+    } else {
+      reqBody = params.content;
+      contentType = "text/plain; charset=utf-8";
     }
   } else {
-    reqBody = params.content;
-    contentType = "text/plain; charset=utf-8";
+    return "Error: Either content or local_path must be provided.";
   }
 
   try {
@@ -690,7 +717,7 @@ function createServer(): McpServer {
 
   server.tool(
     "nextcloud-upload",
-    "Upload a file to NextCloud via WebDAV. Supports text and base64-encoded binary content.",
+    "Upload a file to NextCloud via WebDAV. Supports text content, base64-encoded binary, or local_path to read a file directly from the server's filesystem (no base64 needed).",
     UploadInput,
     async (params) => ({
       content: [{ type: "text" as const, text: await upload(params) }],

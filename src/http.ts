@@ -18,7 +18,7 @@
  *
  * Usage: PORT=8902 SECRETS_DIR=/secrets bun run src/http.ts
  */
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync, statSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
@@ -215,29 +215,44 @@ const MAX_LOCAL_UPLOAD_SIZE = 100 * 1024 * 1024; // 100MB
 // Allowed source directories for local_path uploads.
 // Resolved paths must start with one of these prefixes.
 // Prevents reading /proc, /secrets, or other sensitive paths.
-const ALLOWED_SOURCE_DIRS = (process.env["UPLOAD_ALLOWED_DIRS"] || "/tmp,/data").split(",").map(d => d.trim());
+const ALLOWED_SOURCE_DIRS = (process.env["UPLOAD_ALLOWED_DIRS"] || "/tmp,/data")
+  .split(",")
+  .map(d => d.trim())
+  .filter(d => d.length > 0);
 
-function validateLocalPath(localPath: string): string | null {
-  const resolved = resolve(localPath);
+if (ALLOWED_SOURCE_DIRS.length === 0) {
+  console.error("UPLOAD_ALLOWED_DIRS produced no valid directories — refusing to start. Fix the env var (no empty entries, no trailing commas).");
+  process.exit(1);
+}
 
-  // Must land in an allowed directory
-  if (!ALLOWED_SOURCE_DIRS.some(prefix => resolved === prefix || resolved.startsWith(prefix + "/"))) {
-    return `local_path must be within allowed directories: ${ALLOWED_SOURCE_DIRS.join(", ")}`;
-  }
-
-  // Must be a regular file (not directory, device, pipe, symlink to outside)
+/** Validate a local_path and return the real (symlink-resolved) path, or an error string. */
+function validateLocalPath(localPath: string): { resolved: string; size: number } | { error: string } {
+  // Resolve symlinks to their true target — prevents symlink escape from allowed dirs
+  let realPath: string;
   try {
-    const stat = statSync(resolved); // follows symlinks — resolved path already checked
-    if (!stat.isFile()) return `Not a regular file: ${resolved}`;
-    if (stat.size > MAX_LOCAL_UPLOAD_SIZE) {
-      return `File too large (${(stat.size / 1024 / 1024).toFixed(1)}MB). Max: ${MAX_LOCAL_UPLOAD_SIZE / 1024 / 1024}MB.`;
-    }
+    realPath = realpathSync(localPath);
   } catch (e) {
     const msg = e instanceof Error ? e.message : "unknown error";
-    return `Cannot read file: ${msg}`;
+    return { error: `Cannot resolve path: ${msg}` };
   }
 
-  return null;
+  // Must land in an allowed directory (checked against the REAL path, not the symlink)
+  if (!ALLOWED_SOURCE_DIRS.some(prefix => realPath === prefix || realPath.startsWith(prefix + "/"))) {
+    return { error: "local_path is not in an allowed directory." };
+  }
+
+  // Must be a regular file (not directory, device, pipe)
+  try {
+    const stat = statSync(realPath);
+    if (!stat.isFile()) return { error: "local_path is not a regular file." };
+    if (stat.size > MAX_LOCAL_UPLOAD_SIZE) {
+      return { error: `File too large (${(stat.size / 1024 / 1024).toFixed(1)}MB). Max: ${MAX_LOCAL_UPLOAD_SIZE / 1024 / 1024}MB.` };
+    }
+    return { resolved: realPath, size: stat.size };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "unknown error";
+    return { error: `Cannot access file: ${msg}` };
+  }
 }
 
 async function upload(params: {
@@ -256,36 +271,52 @@ async function upload(params: {
 
   let contentType = "application/octet-stream";
   let reqBody: BodyInit;
+  let fileSizeBytes = 0;
+  let timeoutMs = 30_000; // default for inline content
 
   if (params.local_path) {
-    const localErr = validateLocalPath(params.local_path);
-    if (localErr) return `Error: ${localErr}`;
+    const result = validateLocalPath(params.local_path);
+    if ("error" in result) return `Error: ${result.error}`;
 
-    const resolved = resolve(params.local_path);
-    const file = Bun.file(resolved);
+    const file = Bun.file(result.resolved);
     reqBody = file;
+    fileSizeBytes = result.size;
     contentType = file.type || "application/octet-stream";
+    // Scale timeout: base 30s + 1s per MB, capped at 300s
+    timeoutMs = Math.min(30_000 + Math.ceil(result.size / (1024 * 1024)) * 1_000, 300_000);
   } else if (params.content) {
     if (params.encoding === "base64") {
       try {
         const binary = atob(params.content);
         reqBody = new Blob([Uint8Array.from(binary, (c) => c.charCodeAt(0))]);
+        fileSizeBytes = binary.length;
       } catch {
         return "Error: Invalid base64 content.";
       }
     } else {
       reqBody = params.content;
+      fileSizeBytes = new TextEncoder().encode(params.content).length;
       contentType = "text/plain; charset=utf-8";
     }
   } else {
     return "Error: Provide either content (inline data) or local_path (file on disk).";
   }
 
-  try {
-    const res = await webdav("PUT", params.path, { "Content-Type": contentType }, reqBody);
+  const sizeStr = fileSizeBytes >= 1e6
+    ? `${(fileSizeBytes / 1e6).toFixed(1)}MB`
+    : `${(fileSizeBytes / 1e3).toFixed(1)}KB`;
 
-    if (res.status === 201) return `Uploaded: ${params.path} (created)`;
-    if (res.status === 204) return `Uploaded: ${params.path} (overwritten)`;
+  try {
+    const url = `${WEBDAV_BASE}${normalizePath(params.path)}`;
+    const res = await fetch(url, {
+      method: "PUT",
+      headers: { Authorization: AUTH_HEADER, "Content-Type": contentType },
+      body: reqBody,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+
+    if (res.status === 201) return `Uploaded: ${params.path} (created, ${sizeStr})`;
+    if (res.status === 204) return `Uploaded: ${params.path} (overwritten, ${sizeStr})`;
     if (res.status === 409)
       return "Error: Parent directory does not exist. Create it first with nextcloud-mkdir.";
     return `Upload failed (${res.status})`;

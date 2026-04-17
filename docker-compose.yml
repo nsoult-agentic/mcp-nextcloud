@@ -37,6 +37,8 @@ services:
     volumes:
       # Secrets — root-owned on host, read-only in container
       - /srv/mcp-nextcloud/secrets:/secrets:ro
+      # Upload staging — host files placed here can be uploaded via local_path
+      - /srv/mcp-nextcloud/upload:/data/upload:ro
     tmpfs:
       - /tmp:size=64m,noexec,nosuid
 
@@ -53,6 +55,7 @@ services:
       - NODE_ENV=production
       - SECRETS_DIR=/secrets
       - PORT=8902
+      - UPLOAD_ALLOWED_DIRS=/data/upload
       # NEVER put credentials here — read from /secrets/credentials.json
 
 networks:

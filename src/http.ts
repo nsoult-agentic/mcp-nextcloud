@@ -18,7 +18,7 @@
  *
  * Usage: PORT=8902 SECRETS_DIR=/secrets bun run src/http.ts
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
@@ -191,24 +191,54 @@ const UploadInput = {
     .string()
     .min(1)
     .max(500)
-    .describe("Destination path including filename (e.g., 'Documents/report.pdf')"),
+    .describe("Destination path on NextCloud including filename (e.g., 'Documents/report.pdf'). Existing files are overwritten."),
   content: z
     .string()
+    .min(1)
     .max(10_000_000)
     .optional()
-    .describe("File content — plain text or base64-encoded binary (max ~7.5MB decoded). Required if local_path is not set."),
+    .describe("Inline file content — plain text or base64-encoded binary (max ~7.5MB decoded). Mutually exclusive with local_path — provide one or the other."),
   encoding: z
     .enum(["text", "base64"])
     .default("text")
-    .describe("Content encoding: 'text' (default) or 'base64' for binary files. Ignored when local_path is used."),
+    .describe("Encoding of the content parameter: 'text' (default) or 'base64'. Only applies when using content, not local_path."),
   local_path: z
     .string()
+    .min(1)
     .max(1000)
     .optional()
-    .describe("Absolute path to a file on the server's local filesystem. The server reads the file directly — no base64 needed. Max 100MB."),
+    .describe("Absolute path to a file on disk to upload directly (e.g., '/tmp/recording.wav'). Preferred for binary files — no base64 needed. Max 100MB. Mutually exclusive with content."),
 };
 
 const MAX_LOCAL_UPLOAD_SIZE = 100 * 1024 * 1024; // 100MB
+
+// Allowed source directories for local_path uploads.
+// Resolved paths must start with one of these prefixes.
+// Prevents reading /proc, /secrets, or other sensitive paths.
+const ALLOWED_SOURCE_DIRS = (process.env["UPLOAD_ALLOWED_DIRS"] || "/tmp,/data").split(",").map(d => d.trim());
+
+function validateLocalPath(localPath: string): string | null {
+  const resolved = resolve(localPath);
+
+  // Must land in an allowed directory
+  if (!ALLOWED_SOURCE_DIRS.some(prefix => resolved === prefix || resolved.startsWith(prefix + "/"))) {
+    return `local_path must be within allowed directories: ${ALLOWED_SOURCE_DIRS.join(", ")}`;
+  }
+
+  // Must be a regular file (not directory, device, pipe, symlink to outside)
+  try {
+    const stat = statSync(resolved); // follows symlinks — resolved path already checked
+    if (!stat.isFile()) return `Not a regular file: ${resolved}`;
+    if (stat.size > MAX_LOCAL_UPLOAD_SIZE) {
+      return `File too large (${(stat.size / 1024 / 1024).toFixed(1)}MB). Max: ${MAX_LOCAL_UPLOAD_SIZE / 1024 / 1024}MB.`;
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "unknown error";
+    return `Cannot read file: ${msg}`;
+  }
+
+  return null;
+}
 
 async function upload(params: {
   path: string;
@@ -219,24 +249,22 @@ async function upload(params: {
   const err = validatePath(params.path);
   if (err) return `Error: ${err}`;
 
+  // Reject ambiguous input — exactly one source required
+  if (params.local_path && params.content) {
+    return "Error: Provide either local_path or content, not both. Use local_path for files on disk, content for inline data.";
+  }
+
   let contentType = "application/octet-stream";
   let reqBody: BodyInit;
 
   if (params.local_path) {
-    // Read file directly from local filesystem
-    const localPath = params.local_path;
-    if (localPath.includes("..")) return "Error: Path traversal (..) not allowed in local_path.";
-    if (!localPath.startsWith("/")) return "Error: local_path must be an absolute path.";
+    const localErr = validateLocalPath(params.local_path);
+    if (localErr) return `Error: ${localErr}`;
 
-    try {
-      const file = Bun.file(localPath);
-      if (!await file.exists()) return `Error: Local file not found: ${localPath}`;
-      if (file.size > MAX_LOCAL_UPLOAD_SIZE) return `Error: File too large (${(file.size / 1024 / 1024).toFixed(1)}MB). Max: ${MAX_LOCAL_UPLOAD_SIZE / 1024 / 1024}MB.`;
-      reqBody = file;
-      contentType = file.type || "application/octet-stream";
-    } catch {
-      return `Error: Failed to read local file: ${localPath}`;
-    }
+    const resolved = resolve(params.local_path);
+    const file = Bun.file(resolved);
+    reqBody = file;
+    contentType = file.type || "application/octet-stream";
   } else if (params.content) {
     if (params.encoding === "base64") {
       try {
@@ -250,7 +278,7 @@ async function upload(params: {
       contentType = "text/plain; charset=utf-8";
     }
   } else {
-    return "Error: Either content or local_path must be provided.";
+    return "Error: Provide either content (inline data) or local_path (file on disk).";
   }
 
   try {
@@ -261,8 +289,9 @@ async function upload(params: {
     if (res.status === 409)
       return "Error: Parent directory does not exist. Create it first with nextcloud-mkdir.";
     return `Upload failed (${res.status})`;
-  } catch {
-    return "Upload failed — NextCloud request error.";
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "";
+    return `Upload failed — NextCloud request error.${msg ? ` (${msg})` : ""}`;
   }
 }
 
@@ -717,7 +746,7 @@ function createServer(): McpServer {
 
   server.tool(
     "nextcloud-upload",
-    "Upload a file to NextCloud via WebDAV. Supports text content, base64-encoded binary, or local_path to read a file directly from the server's filesystem (no base64 needed).",
+    "Upload a file to NextCloud. Two modes: (1) pass content for inline text or base64 data, (2) pass local_path for files already on disk (preferred for binary files — no encoding needed, up to 100MB). Provide exactly one of content or local_path.",
     UploadInput,
     async (params) => ({
       content: [{ type: "text" as const, text: await upload(params) }],

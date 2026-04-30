@@ -19,8 +19,8 @@
  *
  * Usage: PORT=8902 SECRETS_DIR=/secrets bun run src/http.ts
  */
-import { readFileSync, statSync, realpathSync } from "node:fs";
-import { resolve } from "node:path";
+import { readFileSync, statSync, realpathSync, writeFileSync, mkdirSync } from "node:fs";
+import { resolve, basename } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
@@ -1020,6 +1020,69 @@ const httpServer = Bun.serve({
           JSON.stringify({ status: "degraded", service: "mcp-nextcloud", nextcloud: false }),
           { status: 503, headers: { "Content-Type": "application/json" } },
         );
+      }
+    }
+
+    if (url.pathname === "/receive" && req.method === "POST") {
+      try {
+        const filename = url.searchParams.get("filename");
+        if (!filename) {
+          return new Response(JSON.stringify({ error: "Missing ?filename= parameter" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+
+        // Sanitize filename — strip path components, allow only safe characters
+        const clean = basename(filename).replace(/[^a-zA-Z0-9._-]/g, "_");
+        if (!clean || clean === "." || clean === "..") {
+          return new Response(JSON.stringify({ error: "Invalid filename" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+
+        const body = await req.arrayBuffer();
+        if (body.byteLength === 0) {
+          return new Response(JSON.stringify({ error: "Empty body" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        if (body.byteLength > 50 * 1024 * 1024) {
+          return new Response(JSON.stringify({ error: "File too large (max 50MB)" }), {
+            status: 413,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+
+        const uploadDir = "/data/upload";
+        mkdirSync(uploadDir, { recursive: true });
+        const dest = resolve(uploadDir, clean);
+
+        // Final path traversal check
+        if (!dest.startsWith(uploadDir + "/")) {
+          return new Response(JSON.stringify({ error: "Path traversal rejected" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+
+        writeFileSync(dest, Buffer.from(body));
+        const sizeMB = (body.byteLength / 1_048_576).toFixed(2);
+        console.log(`[receive] Staged file: ${clean} (${sizeMB} MB)`);
+
+        return new Response(
+          JSON.stringify({ staged: clean, size_bytes: body.byteLength, local_path: `/data/upload/${clean}` }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "unknown error";
+        console.error(`[receive] Error: ${msg}`);
+        return new Response(JSON.stringify({ error: "Internal error" }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        });
       }
     }
 

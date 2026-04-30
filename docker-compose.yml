@@ -17,7 +17,8 @@ services:
     networks:
       - mcp_network
     ports:
-      - "127.0.0.1:8902:8902"  # Loopback ONLY — no external access
+      - "127.0.0.1:8902:8902"  # Loopback — Claude Code MCP access
+      - "172.16.10.25:8902:8902"  # LAN — FRAME-DESK file push via /receive
 
     # ── Security Hardening ──
     read_only: true
@@ -37,8 +38,8 @@ services:
     volumes:
       # Secrets — root-owned on host, read-only in container
       - /srv/mcp-nextcloud/secrets:/secrets:ro
-      # Upload staging — host files placed here can be uploaded via local_path
-      - /srv/mcp-nextcloud/upload:/data/upload:ro
+      # Upload staging — writable for /receive endpoint + readable for local_path uploads
+      - /srv/mcp-nextcloud/upload:/data/upload:rw
     tmpfs:
       - /tmp:size=64m,noexec,nosuid
 

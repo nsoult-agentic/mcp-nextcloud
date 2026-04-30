@@ -510,9 +510,37 @@ async function search(params: {
   }
 }
 
-// ── OCS API Helper (for Share API) ────────────────────────
+// ── OCS API Helpers ───────────────────────────────────────
 
-const OCS_BASE = `${creds.server.replace(/\/+$/, "")}/ocs/v2.php/apps/files_sharing/api/v1`;
+const OCS_SHARE_BASE = `${creds.server.replace(/\/+$/, "")}/ocs/v2.php/apps/files_sharing/api/v1`;
+const OCS_CLOUD_BASE = `${creds.server.replace(/\/+$/, "")}/ocs/v1.php/cloud`;
+
+async function ocsGet(
+  baseUrl: string,
+  endpoint: string,
+  params: Record<string, string> = {},
+): Promise<{ status: number; data: any; meta: any }> {
+  const qs = new URLSearchParams(params);
+  const sep = endpoint.includes("?") ? "&" : "?";
+  const url = `${baseUrl}${endpoint}${qs.toString() ? sep + qs.toString() : ""}`;
+  const res = await fetch(url, {
+    method: "GET",
+    headers: {
+      Authorization: AUTH_HEADER,
+      "OCS-APIRequest": "true",
+      Accept: "application/json",
+    },
+    signal: AbortSignal.timeout(15_000),
+  });
+  const json = await res.json();
+  return {
+    status: res.status,
+    data: json?.ocs?.data ?? json,
+    meta: json?.ocs?.meta ?? {},
+  };
+}
+
+const OCS_BASE = OCS_SHARE_BASE;
 
 async function ocsPost(
   endpoint: string,
@@ -533,6 +561,95 @@ async function ocsPost(
   });
   const json = await res.json();
   return { status: res.status, data: json?.ocs?.data ?? json };
+}
+
+// ── Tool: nextcloud-list-users ────────────────────────────
+
+const ListUsersInput = {
+  search: z
+    .string()
+    .max(100)
+    .optional()
+    .describe("Optional search term to filter users by username or display name"),
+  limit: z
+    .number()
+    .int()
+    .min(1)
+    .max(100)
+    .default(50)
+    .describe("Maximum users to return (default: 50)"),
+};
+
+async function listUsers(params: {
+  search?: string;
+  limit: number;
+}): Promise<string> {
+  try {
+    const qp: Record<string, string> = { limit: String(params.limit) };
+    if (params.search) qp.search = params.search;
+
+    const { status, data, meta } = await ocsGet(OCS_CLOUD_BASE, "/users", qp);
+
+    if (meta?.statuscode !== 100 && status !== 200) {
+      return `List users failed (status ${status})`;
+    }
+
+    const users: string[] = data?.users ?? (Array.isArray(data) ? data : []);
+    if (users.length === 0) return "No users found.";
+
+    return `## Users (${users.length})\n${users.map((u: string) => `- ${sanitizeOutput(u)}`).join("\n")}`;
+  } catch {
+    return "List users failed — NextCloud request error.";
+  }
+}
+
+// ── Tool: nextcloud-get-user ─────────────────────────────
+
+const GetUserInput = {
+  userId: z
+    .string()
+    .min(1)
+    .max(100)
+    .describe("NextCloud username to look up (e.g., 'admin', 'lucy')"),
+};
+
+async function getUser(params: { userId: string }): Promise<string> {
+  try {
+    const { status, data, meta } = await ocsGet(
+      OCS_CLOUD_BASE,
+      `/users/${encodeURIComponent(params.userId)}`,
+    );
+
+    if (meta?.statuscode !== 100 && status !== 200) {
+      return `User not found or access denied (status ${status})`;
+    }
+
+    const lines: string[] = [`## User: ${sanitizeOutput(data.id ?? params.userId)}`];
+    if (data.displayname) lines.push(`- **Display name:** ${sanitizeOutput(data.displayname)}`);
+    if (data.email) lines.push(`- **Email:** ${sanitizeOutput(data.email)}`);
+    if (data.language) lines.push(`- **Language:** ${sanitizeOutput(data.language)}`);
+    if (data.locale) lines.push(`- **Locale:** ${sanitizeOutput(data.locale)}`);
+    if (data.lastLogin) {
+      const d = new Date(data.lastLogin * 1000);
+      lines.push(`- **Last login:** ${d.toISOString()}`);
+    }
+    if (data.groups && Array.isArray(data.groups)) {
+      lines.push(`- **Groups:** ${data.groups.map((g: string) => sanitizeOutput(g)).join(", ") || "none"}`);
+    }
+    if (data.quota) {
+      const q = data.quota;
+      const used = q.used ? `${(q.used / 1_073_741_824).toFixed(2)} GB` : "0";
+      const total = q.total && q.total > 0 ? `${(q.total / 1_073_741_824).toFixed(2)} GB` : "unlimited";
+      lines.push(`- **Quota:** ${used} / ${total}`);
+    }
+    if (typeof data.enabled === "boolean") {
+      lines.push(`- **Enabled:** ${data.enabled ? "yes" : "no"}`);
+    }
+
+    return lines.join("\n");
+  } catch {
+    return "Get user failed — NextCloud request error.";
+  }
 }
 
 // ── Tool: nextcloud-share ─────────────────────────────────
@@ -808,6 +925,24 @@ function createServer(): McpServer {
     SearchInput,
     async (params) => ({
       content: [{ type: "text" as const, text: await search(params) }],
+    }),
+  );
+
+  server.tool(
+    "nextcloud-list-users",
+    "List NextCloud users. Returns usernames. Optionally filter by search term.",
+    ListUsersInput,
+    async (params) => ({
+      content: [{ type: "text" as const, text: await listUsers(params) }],
+    }),
+  );
+
+  server.tool(
+    "nextcloud-get-user",
+    "Get details for a NextCloud user: display name, email, groups, quota, last login.",
+    GetUserInput,
+    async (params) => ({
+      content: [{ type: "text" as const, text: await getUser(params) }],
     }),
   );
 

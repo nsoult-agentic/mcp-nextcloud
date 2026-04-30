@@ -12,6 +12,7 @@
  *   nextcloud-copy    — Copy a file or folder via WebDAV COPY (server-side, no data transfer)
  *   nextcloud-delete    — Delete a file or folder via WebDAV DELETE
  *   nextcloud-download  — Download file content via WebDAV GET (text or base64)
+ *   nextcloud-list-users — List users available for sharing via OCS Sharees API (no admin required)
  *
  * SECURITY: Credentials read from /secrets/credentials.json (mounted from /srv/).
  * Credentials never appear in tool output. Generic error messages only.
@@ -513,7 +514,6 @@ async function search(params: {
 // ── OCS API Helpers ───────────────────────────────────────
 
 const OCS_SHARE_BASE = `${creds.server.replace(/\/+$/, "")}/ocs/v2.php/apps/files_sharing/api/v1`;
-const OCS_CLOUD_BASE = `${creds.server.replace(/\/+$/, "")}/ocs/v1.php/cloud`;
 
 async function ocsGet(
   baseUrl: string,
@@ -563,14 +563,14 @@ async function ocsPost(
   return { status: res.status, data: json?.ocs?.data ?? json };
 }
 
-// ── Tool: nextcloud-list-users ────────────────────────────
+// ── Tool: nextcloud-list-users (via Sharees API — no admin required) ──
 
 const ListUsersInput = {
   search: z
     .string()
     .max(100)
-    .optional()
-    .describe("Optional search term to filter users by username or display name"),
+    .default("")
+    .describe("Search term to filter users by username or display name (empty = all)"),
   limit: z
     .number()
     .int()
@@ -581,75 +581,48 @@ const ListUsersInput = {
 };
 
 async function listUsers(params: {
-  search?: string;
+  search: string;
   limit: number;
 }): Promise<string> {
   try {
-    const qp: Record<string, string> = { limit: String(params.limit) };
-    if (params.search) qp.search = params.search;
+    const qp: Record<string, string> = {
+      search: params.search,
+      itemType: "file",
+      perPage: String(params.limit),
+    };
 
-    const { status, data, meta } = await ocsGet(OCS_CLOUD_BASE, "/users", qp);
+    const { status, data, meta } = await ocsGet(OCS_SHARE_BASE, "/sharees", qp);
 
-    if (meta?.statuscode !== 100) {
-      return `List users failed (OCS status ${meta?.statuscode ?? "unknown"}, HTTP ${status})`;
+    if (status !== 200) {
+      return `List users failed (HTTP ${status})`;
     }
 
-    const users: string[] = data?.users ?? (Array.isArray(data) ? data : []);
-    if (users.length === 0) return "No users found.";
+    const users: Array<{ label: string; value: { shareWith: string } }> =
+      data?.users ?? data?.exact?.users ?? [];
+    const exact: Array<{ label: string; value: { shareWith: string } }> =
+      data?.exact?.users ?? [];
+    const all = [...exact, ...users];
 
-    return `## Users (${users.length})\n${users.map((u: string) => `- ${sanitizeOutput(u)}`).join("\n")}`;
+    // Deduplicate by shareWith
+    const seen = new Set<string>();
+    const unique = all.filter((u) => {
+      const id = u?.value?.shareWith;
+      if (!id || seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    });
+
+    if (unique.length === 0) return "No users found.";
+
+    const lines = unique.map((u) => {
+      const id = sanitizeOutput(u.value.shareWith);
+      const name = sanitizeOutput(u.label);
+      return id === name ? `- ${id}` : `- ${id} (${name})`;
+    });
+
+    return `## Users (${unique.length})\n${lines.join("\n")}`;
   } catch {
     return "List users failed — NextCloud request error.";
-  }
-}
-
-// ── Tool: nextcloud-get-user ─────────────────────────────
-
-const GetUserInput = {
-  userId: z
-    .string()
-    .min(1)
-    .max(100)
-    .regex(/^[a-zA-Z0-9._@-]+$/, "userId must be alphanumeric, dots, underscores, @ or hyphens")
-    .describe("NextCloud username to look up (e.g., 'admin', 'lucy')"),
-};
-
-async function getUser(params: { userId: string }): Promise<string> {
-  try {
-    const { status, data, meta } = await ocsGet(
-      OCS_CLOUD_BASE,
-      `/users/${encodeURIComponent(params.userId)}`,
-    );
-
-    if (meta?.statuscode !== 100) {
-      return `User not found or access denied (OCS status ${meta?.statuscode ?? "unknown"}, HTTP ${status})`;
-    }
-
-    const lines: string[] = [`## User: ${sanitizeOutput(data.id ?? params.userId)}`];
-    if (data.displayname) lines.push(`- **Display name:** ${sanitizeOutput(data.displayname)}`);
-    if (data.email) lines.push(`- **Email:** ${sanitizeOutput(data.email)}`);
-    if (data.language) lines.push(`- **Language:** ${sanitizeOutput(data.language)}`);
-    if (data.locale) lines.push(`- **Locale:** ${sanitizeOutput(data.locale)}`);
-    if (data.lastLogin && data.lastLogin > 0) {
-      const d = new Date(data.lastLogin * 1000);
-      lines.push(`- **Last login:** ${d.toISOString()}`);
-    }
-    if (data.groups && Array.isArray(data.groups)) {
-      lines.push(`- **Groups:** ${data.groups.map((g: string) => sanitizeOutput(g)).join(", ") || "none"}`);
-    }
-    if (data.quota) {
-      const q = data.quota;
-      const used = q.used ? `${(q.used / 1_073_741_824).toFixed(2)} GB` : "0";
-      const total = q.total && q.total > 0 ? `${(q.total / 1_073_741_824).toFixed(2)} GB` : "unlimited";
-      lines.push(`- **Quota:** ${used} / ${total}`);
-    }
-    if (typeof data.enabled === "boolean") {
-      lines.push(`- **Enabled:** ${data.enabled ? "yes" : "no"}`);
-    }
-
-    return lines.join("\n");
-  } catch {
-    return "Get user failed — NextCloud request error.";
   }
 }
 
@@ -931,19 +904,10 @@ function createServer(): McpServer {
 
   server.tool(
     "nextcloud-list-users",
-    "List NextCloud users. Returns usernames. Optionally filter by search term.",
+    "List NextCloud users available for file sharing. Returns usernames and display names. Uses the Sharees API (no admin required).",
     ListUsersInput,
     async (params) => ({
       content: [{ type: "text" as const, text: await listUsers(params) }],
-    }),
-  );
-
-  server.tool(
-    "nextcloud-get-user",
-    "Get details for a NextCloud user: display name, email, groups, quota, last login.",
-    GetUserInput,
-    async (params) => ({
-      content: [{ type: "text" as const, text: await getUser(params) }],
     }),
   );
 

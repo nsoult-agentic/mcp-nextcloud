@@ -590,8 +590,8 @@ async function listUsers(params: {
 
     const { status, data, meta } = await ocsGet(OCS_CLOUD_BASE, "/users", qp);
 
-    if (meta?.statuscode !== 100 && status !== 200) {
-      return `List users failed (status ${status})`;
+    if (meta?.statuscode !== 100) {
+      return `List users failed (OCS status ${meta?.statuscode ?? "unknown"}, HTTP ${status})`;
     }
 
     const users: string[] = data?.users ?? (Array.isArray(data) ? data : []);
@@ -610,6 +610,7 @@ const GetUserInput = {
     .string()
     .min(1)
     .max(100)
+    .regex(/^[a-zA-Z0-9._@-]+$/, "userId must be alphanumeric, dots, underscores, @ or hyphens")
     .describe("NextCloud username to look up (e.g., 'admin', 'lucy')"),
 };
 
@@ -620,8 +621,8 @@ async function getUser(params: { userId: string }): Promise<string> {
       `/users/${encodeURIComponent(params.userId)}`,
     );
 
-    if (meta?.statuscode !== 100 && status !== 200) {
-      return `User not found or access denied (status ${status})`;
+    if (meta?.statuscode !== 100) {
+      return `User not found or access denied (OCS status ${meta?.statuscode ?? "unknown"}, HTTP ${status})`;
     }
 
     const lines: string[] = [`## User: ${sanitizeOutput(data.id ?? params.userId)}`];
@@ -629,7 +630,7 @@ async function getUser(params: { userId: string }): Promise<string> {
     if (data.email) lines.push(`- **Email:** ${sanitizeOutput(data.email)}`);
     if (data.language) lines.push(`- **Language:** ${sanitizeOutput(data.language)}`);
     if (data.locale) lines.push(`- **Locale:** ${sanitizeOutput(data.locale)}`);
-    if (data.lastLogin) {
+    if (data.lastLogin && data.lastLogin > 0) {
       const d = new Date(data.lastLogin * 1000);
       lines.push(`- **Last login:** ${d.toISOString()}`);
     }
@@ -1075,7 +1076,7 @@ const httpServer = Bun.serve({
 });
 
 console.log(`mcp-nextcloud listening on http://0.0.0.0:${PORT}/mcp`);
-console.log("Tools: 9 | NextCloud: connected");
+console.log("Tools: 11 | NextCloud: connected");
 
 process.on("SIGTERM", () => {
   httpServer.stop();

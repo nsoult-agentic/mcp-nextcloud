@@ -20,7 +20,7 @@
  * Usage: PORT=8902 SECRETS_DIR=/secrets bun run src/http.ts
  */
 import { readFileSync, statSync, realpathSync, writeFileSync, mkdirSync } from "node:fs";
-import { resolve, basename } from "node:path";
+import { resolve, basename, dirname } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
@@ -163,7 +163,7 @@ function parseMultistatus(xml: string, basePath: string): DavEntry[] {
 
 /** Strip markdown-active, control characters, and newlines from untrusted strings in tool output */
 function sanitizeOutput(s: string): string {
-  return s.replace(/[|[\](){}#*_~`<>!\x00-\x1f\r\n]/g, "_").slice(0, 255);
+  return s.replace(/[|[\]{}#*_~`<>!\x00-\x1f\r\n]/g, "_").slice(0, 255);
 }
 
 // ── Formatting ─────────────────────────────────────────────
@@ -794,12 +794,48 @@ async function del(params: { path: string }): Promise<string> {
 
 // ── Tool: nextcloud-download ─────────────────────────────
 
+const DOWNLOAD_ALLOWED_DIRS = (process.env["DOWNLOAD_ALLOWED_DIRS"] || "/tmp,/data")
+  .split(",")
+  .map(d => d.trim())
+  .filter(d => d.length > 0);
+
+/** Validate a save_path for downloads — parent dir must exist and be in allowed dirs. */
+function validateSavePath(savePath: string): { resolved: string } | { error: string } {
+  const absPath = resolve(savePath);
+  const dir = dirname(absPath);
+  let realDir: string;
+  try {
+    realDir = realpathSync(dir);
+  } catch {
+    return { error: `Parent directory does not exist: ${dir}` };
+  }
+
+  const filename = basename(absPath);
+  if (!filename || filename === "." || filename === "..") {
+    return { error: "save_path must include a filename" };
+  }
+
+  const resolvedPath = resolve(realDir, filename);
+
+  if (!DOWNLOAD_ALLOWED_DIRS.some(prefix => resolvedPath === prefix || resolvedPath.startsWith(prefix + "/"))) {
+    return { error: "save_path is not in an allowed directory." };
+  }
+
+  return { resolved: resolvedPath };
+}
+
 const DownloadInput = {
   path: z
     .string()
     .min(1)
     .max(500)
     .describe("Path to the file to download (e.g., 'Shared/Accounting/Invoices/2026/invoice.pdf')"),
+  save_path: z
+    .string()
+    .min(1)
+    .max(1000)
+    .optional()
+    .describe("Save downloaded file to this local path instead of returning content. Must be in an allowed directory (/tmp or /data). Example: '/data/upload/icon.png'"),
 };
 
 const MAX_DOWNLOAD_SIZE = 25 * 1024 * 1024; // 25MB
@@ -949,10 +985,29 @@ function createServer(): McpServer {
 
   server.tool(
     "nextcloud-download",
-    "Download a file from NextCloud. Returns text content for text files, base64 for binary files (PDF, images, etc.). Max 25MB.",
+    "Download a file from NextCloud. Returns text content for text files, base64 for binary files (PDF, images, etc.). Max 25MB. Use save_path to save directly to disk instead of returning content.",
     DownloadInput,
     async (params) => {
       try {
+        // Save to disk mode
+        if (params.save_path) {
+          const validation = validateSavePath(params.save_path);
+          if ("error" in validation) {
+            return { content: [{ type: "text" as const, text: `Error: ${validation.error}` }] };
+          }
+
+          const result = await download(params);
+          const buffer = result.type === "text"
+            ? Buffer.from(result.content)
+            : Buffer.from(result.content, "base64");
+
+          writeFileSync(validation.resolved, buffer);
+          return {
+            content: [{ type: "text" as const, text: `Downloaded: ${params.path} → ${validation.resolved} (${fmtSize(buffer.byteLength)})` }],
+          };
+        }
+
+        // Return content mode (default)
         const result = await download(params);
         if (result.type === "text") {
           return {

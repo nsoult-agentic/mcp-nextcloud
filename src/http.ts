@@ -73,7 +73,7 @@ function validatePath(p: string): string | null {
   if (decoded.includes("\\")) return "Backslashes not allowed";
   if (/[\x00-\x1f]/.test(decoded)) return "Control characters not allowed";
   if (p.includes("%00") || p.includes("\x00")) return "Null bytes not allowed";
-  if (/[?#@]/.test(p)) return "Path contains invalid characters";
+  if (/[?]/.test(p)) return "Path contains invalid characters";
   return null;
 }
 
@@ -162,9 +162,12 @@ function parseMultistatus(xml: string, basePath: string): DavEntry[] {
 
 // ── Output Sanitization ───────────────────────────────────
 
-/** Strip markdown-active, control characters, and newlines from untrusted strings in tool output */
+/** Escape characters that break markdown tables while preserving filenames intact.
+ *  Only pipe (|) and newlines break table structure — escape pipes, strip control chars.
+ *  All other characters (underscores, brackets, etc.) are preserved so clients can
+ *  use displayed names for subsequent operations (download, move, delete). */
 function sanitizeOutput(s: string): string {
-  return s.replace(/[|[\]{}#*_~`<>!\x00-\x1f\r\n]/g, "_").slice(0, 255);
+  return s.replace(/[\x00-\x1f\r\n]/g, "").replace(/\|/g, "\\|").slice(0, 255);
 }
 
 // ── Formatting ─────────────────────────────────────────────

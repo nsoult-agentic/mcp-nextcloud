@@ -78,7 +78,8 @@ function validatePath(p: string): string | null {
 }
 
 function normalizePath(p: string): string {
-  return "/" + p.replace(/^\/+/, "").replace(/\/+/g, "/");
+  return "/" + p.replace(/^\/+/, "").replace(/\/+/g, "/")
+    .split("/").map(s => encodeURIComponent(s)).join("/");
 }
 
 // ── WebDAV Helper ──────────────────────────────────────────

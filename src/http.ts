@@ -24,6 +24,21 @@ import { resolve, basename, dirname } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
+import {
+  escapeXml,
+  fmtDate,
+  fmtSize,
+  isRateLimited as isRateLimitedPure,
+  isTextFile,
+  normalizePath,
+  parseMultistatus,
+  RATE_LIMIT,
+  RATE_WINDOW_MS,
+  resolvePermissions,
+  sanitizeOutput,
+  sanitizeReceivedFilename,
+  validatePath,
+} from "./webdav-util.js";
 
 // ── Configuration ──────────────────────────────────────────
 
@@ -51,36 +66,14 @@ let creds: Credentials;
 try {
   creds = loadCredentials();
 } catch {
-  console.error("Failed to load credentials — check /secrets/credentials.json exists and is valid JSON");
+  console.error(
+    "Failed to load credentials — check /secrets/credentials.json exists and is valid JSON",
+  );
   process.exit(1);
 }
 
 const WEBDAV_BASE = `${creds.server.replace(/\/+$/, "")}/remote.php/dav/files/${encodeURIComponent(creds.username)}`;
 const AUTH_HEADER = `Basic ${btoa(`${creds.username}:${creds.password}`)}`;
-
-// ── Path Validation ────────────────────────────────────────
-
-function validatePath(p: string): string | null {
-  if (p.length > 500) return "Path too long (max 500 chars)";
-  // Decode URL-encoded characters before validation to catch %2e%2e bypasses
-  let decoded: string;
-  try {
-    decoded = decodeURIComponent(p);
-  } catch {
-    return "Invalid path encoding";
-  }
-  if (decoded.includes("..")) return "Path traversal (..) not allowed";
-  if (decoded.includes("\\")) return "Backslashes not allowed";
-  if (/[\x00-\x1f]/.test(decoded)) return "Control characters not allowed";
-  if (p.includes("%00") || p.includes("\x00")) return "Null bytes not allowed";
-  if (/[?]/.test(p)) return "Path contains invalid characters";
-  return null;
-}
-
-function normalizePath(p: string): string {
-  return "/" + p.replace(/^\/+/, "").replace(/\/+/g, "/")
-    .split("/").map(s => encodeURIComponent(s)).join("/");
-}
 
 // ── WebDAV Helper ──────────────────────────────────────────
 
@@ -99,96 +92,6 @@ async function webdav(
   });
 }
 
-// ── XML Parsing Helpers ────────────────────────────────────
-
-function extractTag(xml: string, tag: string): string {
-  const re = new RegExp(
-    `<(?:[a-z]+:)?${tag}[^>]*>([\\s\\S]*?)<\\/(?:[a-z]+:)?${tag}>`,
-    "i",
-  );
-  const m = xml.match(re);
-  return m ? m[1].trim() : "";
-}
-
-function isCollection(xml: string): boolean {
-  return /<(?:[a-z]+:)?collection\s*\/?>/.test(xml);
-}
-
-interface DavEntry {
-  href: string;
-  name: string;
-  isDir: boolean;
-  size: number;
-  modified: string;
-  contentType: string;
-}
-
-function parseMultistatus(xml: string, basePath: string): DavEntry[] {
-  const entries: DavEntry[] = [];
-  const responses = xml.split(/<(?:[a-z]+:)?response[^>]*>/i).slice(1);
-
-  for (const block of responses) {
-    const href = decodeURIComponent(extractTag(block, "href"));
-    const modified = extractTag(block, "getlastmodified");
-    const sizeStr = extractTag(block, "getcontentlength");
-    const contentType = extractTag(block, "getcontenttype");
-    const dir = isCollection(block);
-
-    const parts = href.replace(/\/+$/, "").split("/");
-    const name = parts[parts.length - 1] || "";
-
-    // Skip entries with empty names
-    if (name === "") continue;
-
-    // Skip the directory itself (first entry in PROPFIND Depth:1)
-    if (basePath) {
-      const normalBase = basePath.replace(/\/+$/, "");
-      const normalHref = href.replace(/\/+$/, "");
-      if (normalHref === normalBase) continue;
-    }
-
-    entries.push({
-      href,
-      name,
-      isDir: dir,
-      size: sizeStr ? parseInt(sizeStr, 10) : 0,
-      modified,
-      contentType: dir ? "directory" : contentType,
-    });
-  }
-
-  return entries;
-}
-
-// ── Output Sanitization ───────────────────────────────────
-
-/** Escape characters that break markdown tables while preserving filenames intact.
- *  Only pipe (|) and newlines break table structure — escape pipes, strip control chars.
- *  All other characters (underscores, brackets, etc.) are preserved so clients can
- *  use displayed names for subsequent operations (download, move, delete). */
-function sanitizeOutput(s: string): string {
-  return s.replace(/[\x00-\x1f\r\n]/g, "").replace(/\|/g, "\\|").slice(0, 255);
-}
-
-// ── Formatting ─────────────────────────────────────────────
-
-function fmtSize(bytes: number): string {
-  if (bytes === 0) return "-";
-  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
-  if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`;
-  if (bytes >= 1e3) return `${(bytes / 1e3).toFixed(1)} KB`;
-  return `${bytes} B`;
-}
-
-function fmtDate(dateStr: string): string {
-  if (!dateStr) return "-";
-  try {
-    return new Date(dateStr).toISOString().slice(0, 16).replace("T", " ");
-  } catch {
-    return dateStr;
-  }
-}
-
 // ── Tool: nextcloud-upload ─────────────────────────────────
 
 const UploadInput = {
@@ -196,23 +99,31 @@ const UploadInput = {
     .string()
     .min(1)
     .max(500)
-    .describe("Destination path on NextCloud including filename (e.g., 'Documents/report.pdf'). Existing files are overwritten."),
+    .describe(
+      "Destination path on NextCloud including filename (e.g., 'Documents/report.pdf'). Existing files are overwritten.",
+    ),
   content: z
     .string()
     .min(1)
     .max(10_000_000)
     .optional()
-    .describe("Inline file content — plain text or base64-encoded binary (max ~7.5MB decoded). Mutually exclusive with local_path — provide one or the other."),
+    .describe(
+      "Inline file content — plain text or base64-encoded binary (max ~7.5MB decoded). Mutually exclusive with local_path — provide one or the other.",
+    ),
   encoding: z
     .enum(["text", "base64"])
     .default("text")
-    .describe("Encoding of the content parameter: 'text' (default) or 'base64'. Only applies when using content, not local_path."),
+    .describe(
+      "Encoding of the content parameter: 'text' (default) or 'base64'. Only applies when using content, not local_path.",
+    ),
   local_path: z
     .string()
     .min(1)
     .max(1000)
     .optional()
-    .describe("Absolute path to a file on disk to upload directly (e.g., '/tmp/recording.wav'). Preferred for binary files — no base64 needed. Max 100MB. Mutually exclusive with content."),
+    .describe(
+      "Absolute path to a file on disk to upload directly (e.g., '/tmp/recording.wav'). Preferred for binary files — no base64 needed. Max 100MB. Mutually exclusive with content.",
+    ),
 };
 
 const MAX_LOCAL_UPLOAD_SIZE = 100 * 1024 * 1024; // 100MB
@@ -222,16 +133,20 @@ const MAX_LOCAL_UPLOAD_SIZE = 100 * 1024 * 1024; // 100MB
 // Prevents reading /proc, /secrets, or other sensitive paths.
 const ALLOWED_SOURCE_DIRS = (process.env["UPLOAD_ALLOWED_DIRS"] || "/tmp,/data")
   .split(",")
-  .map(d => d.trim())
-  .filter(d => d.length > 0);
+  .map((d) => d.trim())
+  .filter((d) => d.length > 0);
 
 if (ALLOWED_SOURCE_DIRS.length === 0) {
-  console.error("UPLOAD_ALLOWED_DIRS produced no valid directories — refusing to start. Fix the env var (no empty entries, no trailing commas).");
+  console.error(
+    "UPLOAD_ALLOWED_DIRS produced no valid directories — refusing to start. Fix the env var (no empty entries, no trailing commas).",
+  );
   process.exit(1);
 }
 
 /** Validate a local_path and return the real (symlink-resolved) path, or an error string. */
-function validateLocalPath(localPath: string): { resolved: string; size: number } | { error: string } {
+function validateLocalPath(
+  localPath: string,
+): { resolved: string; size: number } | { error: string } {
   // Resolve symlinks to their true target — prevents symlink escape from allowed dirs
   let realPath: string;
   try {
@@ -242,7 +157,9 @@ function validateLocalPath(localPath: string): { resolved: string; size: number 
   }
 
   // Must land in an allowed directory (checked against the REAL path, not the symlink)
-  if (!ALLOWED_SOURCE_DIRS.some(prefix => realPath === prefix || realPath.startsWith(prefix + "/"))) {
+  if (
+    !ALLOWED_SOURCE_DIRS.some((prefix) => realPath === prefix || realPath.startsWith(`${prefix}/`))
+  ) {
     return { error: "local_path is not in an allowed directory." };
   }
 
@@ -251,7 +168,9 @@ function validateLocalPath(localPath: string): { resolved: string; size: number 
     const stat = statSync(realPath);
     if (!stat.isFile()) return { error: "local_path is not a regular file." };
     if (stat.size > MAX_LOCAL_UPLOAD_SIZE) {
-      return { error: `File too large (${(stat.size / 1024 / 1024).toFixed(1)}MB). Max: ${MAX_LOCAL_UPLOAD_SIZE / 1024 / 1024}MB.` };
+      return {
+        error: `File too large (${(stat.size / 1024 / 1024).toFixed(1)}MB). Max: ${MAX_LOCAL_UPLOAD_SIZE / 1024 / 1024}MB.`,
+      };
     }
     return { resolved: realPath, size: stat.size };
   } catch (e) {
@@ -307,9 +226,10 @@ async function upload(params: {
     return "Error: Provide either content (inline data) or local_path (file on disk).";
   }
 
-  const sizeStr = fileSizeBytes >= 1e6
-    ? `${(fileSizeBytes / 1e6).toFixed(1)}MB`
-    : `${(fileSizeBytes / 1e3).toFixed(1)}KB`;
+  const sizeStr =
+    fileSizeBytes >= 1e6
+      ? `${(fileSizeBytes / 1e6).toFixed(1)}MB`
+      : `${(fileSizeBytes / 1e3).toFixed(1)}KB`;
 
   try {
     const url = `${WEBDAV_BASE}${normalizePath(params.path)}`;
@@ -334,11 +254,7 @@ async function upload(params: {
 // ── Tool: nextcloud-list ───────────────────────────────────
 
 const ListInput = {
-  path: z
-    .string()
-    .max(500)
-    .default("/")
-    .describe("Directory path to list (default: root '/')"),
+  path: z.string().max(500).default("/").describe("Directory path to list (default: root '/')"),
 };
 
 async function list(params: { path: string }): Promise<string> {
@@ -385,11 +301,7 @@ async function list(params: { path: string }): Promise<string> {
 // ── Tool: nextcloud-mkdir ──────────────────────────────────
 
 const MkdirInput = {
-  path: z
-    .string()
-    .min(1)
-    .max(500)
-    .describe("Directory path to create (e.g., 'Documents/2026/Q1')"),
+  path: z.string().min(1).max(500).describe("Directory path to create (e.g., 'Documents/2026/Q1')"),
 };
 
 async function mkdir(params: { path: string }): Promise<string> {
@@ -402,7 +314,9 @@ async function mkdir(params: { path: string }): Promise<string> {
     if (res.status === 201) {
       // PROPFIND forces NextCloud to register the folder in oc_filecache.
       // Without this, the OCS Share API returns 403 on newly created paths.
-      try { await webdav("PROPFIND", params.path, { Depth: "0" }); } catch {}
+      try {
+        await webdav("PROPFIND", params.path, { Depth: "0" });
+      } catch {}
       return `Created directory: ${params.path}`;
     }
     if (res.status === 405) return `Directory already exists: ${params.path}`;
@@ -418,40 +332,21 @@ async function mkdir(params: { path: string }): Promise<string> {
 // ── Tool: nextcloud-search ─────────────────────────────────
 
 const SearchInput = {
-  query: z
-    .string()
-    .min(1)
-    .max(200)
-    .describe("Search term — matches against file names"),
+  query: z.string().min(1).max(200).describe("Search term — matches against file names"),
   path: z
     .string()
     .max(500)
     .default("/")
     .describe("Directory scope to search within (default: root)"),
-  limit: z
-    .number()
-    .int()
-    .min(1)
-    .max(50)
-    .default(20)
-    .describe("Maximum results (default: 20)"),
+  limit: z.number().int().min(1).max(50).default(20).describe("Maximum results (default: 20)"),
 };
 
-async function search(params: {
-  query: string;
-  path: string;
-  limit: number;
-}): Promise<string> {
+async function search(params: { query: string; path: string; limit: number }): Promise<string> {
   const pathErr = validatePath(params.path);
   if (pathErr) return `Error: ${pathErr}`;
 
   // Sanitize search query for XML inclusion
-  const safeQuery = params.query
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
+  const safeQuery = escapeXml(params.query);
 
   const body = `<?xml version="1.0" encoding="UTF-8"?>
 <oc:filter-files xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">
@@ -505,9 +400,7 @@ async function search(params: {
     }
 
     const suffix =
-      entries.length > params.limit
-        ? ` (showing ${params.limit} of ${entries.length})`
-        : "";
+      entries.length > params.limit ? ` (showing ${params.limit} of ${entries.length})` : "";
     lines.push("", `${limited.length} results${suffix}`);
     return lines.join("\n");
   } catch {
@@ -558,9 +451,7 @@ async function ocsPost(
       "Content-Type": "application/x-www-form-urlencoded",
       Accept: "application/json",
     },
-    body: new URLSearchParams(
-      Object.entries(body).map(([k, v]) => [k, String(v)]),
-    ),
+    body: new URLSearchParams(Object.entries(body).map(([k, v]) => [k, String(v)])),
     signal: AbortSignal.timeout(15_000),
   });
   const json = await res.json();
@@ -584,10 +475,7 @@ const ListUsersInput = {
     .describe("Maximum users to return (default: 50)"),
 };
 
-async function listUsers(params: {
-  search: string;
-  limit: number;
-}): Promise<string> {
+async function listUsers(params: { search: string; limit: number }): Promise<string> {
   try {
     const qp: Record<string, string> = {
       search: params.search,
@@ -595,7 +483,7 @@ async function listUsers(params: {
       perPage: String(params.limit),
     };
 
-    const { status, data, meta } = await ocsGet(OCS_SHARE_BASE, "/sharees", qp);
+    const { status, data } = await ocsGet(OCS_SHARE_BASE, "/sharees", qp);
 
     if (status !== 200) {
       return `List users failed (HTTP ${status})`;
@@ -603,8 +491,7 @@ async function listUsers(params: {
 
     const users: Array<{ label: string; value: { shareWith: string } }> =
       data?.users ?? data?.exact?.users ?? [];
-    const exact: Array<{ label: string; value: { shareWith: string } }> =
-      data?.exact?.users ?? [];
+    const exact: Array<{ label: string; value: { shareWith: string } }> = data?.exact?.users ?? [];
     const all = [...exact, ...users];
 
     // Deduplicate by shareWith
@@ -646,7 +533,9 @@ const ShareInput = {
   permissions: z
     .enum(["read", "read-write", "all"])
     .default("read-write")
-    .describe("Permission level: 'read' (view only), 'read-write' (edit), 'all' (edit + reshare + delete)"),
+    .describe(
+      "Permission level: 'read' (view only), 'read-write' (edit), 'all' (edit + reshare + delete)",
+    ),
 };
 
 async function share(params: {
@@ -657,15 +546,7 @@ async function share(params: {
   const err = validatePath(params.path);
   if (err) return `Error: ${err}`;
 
-  // Map permission strings to NextCloud OCS permission integers
-  // 1=read, 2=update, 4=create, 8=delete, 16=reshare
-  const permMap: Record<string, number> = {
-    "read": 1,
-    "read-write": 1 + 2 + 4,     // read + update + create
-    "all": 1 + 2 + 4 + 8 + 16,   // read + update + create + delete + reshare
-  };
-
-  const permInt = permMap[params.permissions] ?? 7;
+  const permInt = resolvePermissions(params.permissions);
 
   try {
     const { status, data } = await ocsPost("/shares", {
@@ -693,11 +574,7 @@ async function share(params: {
 // ── Tool: nextcloud-move ──────────────────────────────────
 
 const MoveInput = {
-  from: z
-    .string()
-    .min(1)
-    .max(500)
-    .describe("Source path (e.g., 'Shared/old-name.pdf')"),
+  from: z.string().min(1).max(500).describe("Source path (e.g., 'Shared/old-name.pdf')"),
   to: z
     .string()
     .min(1)
@@ -723,7 +600,8 @@ async function move(params: { from: string; to: string }): Promise<string> {
     if (res.status === 204) return `Moved: "${params.from}" → "${params.to}"`;
     if (res.status === 404) return `Error: Source not found — "${params.from}"`;
     if (res.status === 409) return `Error: Destination parent directory does not exist.`;
-    if (res.status === 412) return `Error: Destination already exists. Use a different name or delete it first.`;
+    if (res.status === 412)
+      return `Error: Destination already exists. Use a different name or delete it first.`;
     return `Move failed (${res.status})`;
   } catch {
     return "Move failed — NextCloud request error.";
@@ -733,16 +611,8 @@ async function move(params: { from: string; to: string }): Promise<string> {
 // ── Tool: nextcloud-copy ──────────────────────────────────
 
 const CopyInput = {
-  from: z
-    .string()
-    .min(1)
-    .max(500)
-    .describe("Source path (e.g., 'Shared/document.pdf')"),
-  to: z
-    .string()
-    .min(1)
-    .max(500)
-    .describe("Destination path (e.g., 'Shared/Archive/document.pdf')"),
+  from: z.string().min(1).max(500).describe("Source path (e.g., 'Shared/document.pdf')"),
+  to: z.string().min(1).max(500).describe("Destination path (e.g., 'Shared/Archive/document.pdf')"),
 };
 
 async function copy(params: { from: string; to: string }): Promise<string> {
@@ -763,7 +633,8 @@ async function copy(params: { from: string; to: string }): Promise<string> {
     if (res.status === 204) return `Copied: "${params.from}" → "${params.to}" (overwrote existing)`;
     if (res.status === 404) return `Error: Source not found — "${params.from}"`;
     if (res.status === 409) return `Error: Destination parent directory does not exist.`;
-    if (res.status === 412) return `Error: Destination already exists. Use a different name or delete it first.`;
+    if (res.status === 412)
+      return `Error: Destination already exists. Use a different name or delete it first.`;
     return `Copy failed (${res.status})`;
   } catch {
     return "Copy failed — NextCloud request error.";
@@ -800,8 +671,8 @@ async function del(params: { path: string }): Promise<string> {
 
 const DOWNLOAD_ALLOWED_DIRS = (process.env["DOWNLOAD_ALLOWED_DIRS"] || "/tmp,/data")
   .split(",")
-  .map(d => d.trim())
-  .filter(d => d.length > 0);
+  .map((d) => d.trim())
+  .filter((d) => d.length > 0);
 
 /** Validate a save_path for downloads — parent dir must exist and be in allowed dirs. */
 function validateSavePath(savePath: string): { resolved: string } | { error: string } {
@@ -821,7 +692,11 @@ function validateSavePath(savePath: string): { resolved: string } | { error: str
 
   const resolvedPath = resolve(realDir, filename);
 
-  if (!DOWNLOAD_ALLOWED_DIRS.some(prefix => resolvedPath === prefix || resolvedPath.startsWith(prefix + "/"))) {
+  if (
+    !DOWNLOAD_ALLOWED_DIRS.some(
+      (prefix) => resolvedPath === prefix || resolvedPath.startsWith(`${prefix}/`),
+    )
+  ) {
     return { error: "save_path is not in an allowed directory." };
   }
 
@@ -839,16 +714,12 @@ const DownloadInput = {
     .min(1)
     .max(1000)
     .optional()
-    .describe("Save downloaded file to this local path instead of returning content. Must be in an allowed directory (/tmp or /data). Example: '/data/upload/icon.png'"),
+    .describe(
+      "Save downloaded file to this local path instead of returning content. Must be in an allowed directory (/tmp or /data). Example: '/data/upload/icon.png'",
+    ),
 };
 
 const MAX_DOWNLOAD_SIZE = 25 * 1024 * 1024; // 25MB
-
-const TEXT_EXTENSIONS = new Set([
-  "txt", "md", "csv", "json", "xml", "html", "htm", "yaml", "yml",
-  "toml", "ini", "cfg", "conf", "log", "sh", "bash", "ts", "js",
-  "py", "rb", "go", "rs", "java", "c", "h", "cpp", "css", "sql",
-]);
 
 async function download(params: { path: string }): Promise<{
   type: "text" | "base64";
@@ -867,17 +738,20 @@ async function download(params: { path: string }): Promise<{
 
   const contentLength = Number(res.headers.get("content-length") || 0);
   if (contentLength > MAX_DOWNLOAD_SIZE) {
-    throw new Error(`File too large (${(contentLength / 1024 / 1024).toFixed(1)}MB). Max: ${MAX_DOWNLOAD_SIZE / 1024 / 1024}MB.`);
+    throw new Error(
+      `File too large (${(contentLength / 1024 / 1024).toFixed(1)}MB). Max: ${MAX_DOWNLOAD_SIZE / 1024 / 1024}MB.`,
+    );
   }
 
   const mimeType = res.headers.get("content-type") || "application/octet-stream";
-  const ext = params.path.split(".").pop()?.toLowerCase() || "";
-  const isText = TEXT_EXTENSIONS.has(ext) || mimeType.startsWith("text/");
+  const isText = isTextFile(params.path, mimeType);
 
   const buffer = await res.arrayBuffer();
 
   if (buffer.byteLength > MAX_DOWNLOAD_SIZE) {
-    throw new Error(`File too large (${(buffer.byteLength / 1024 / 1024).toFixed(1)}MB). Max: ${MAX_DOWNLOAD_SIZE / 1024 / 1024}MB.`);
+    throw new Error(
+      `File too large (${(buffer.byteLength / 1024 / 1024).toFixed(1)}MB). Max: ${MAX_DOWNLOAD_SIZE / 1024 / 1024}MB.`,
+    );
   }
 
   if (isText) {
@@ -1001,13 +875,19 @@ function createServer(): McpServer {
           }
 
           const result = await download(params);
-          const buffer = result.type === "text"
-            ? Buffer.from(result.content)
-            : Buffer.from(result.content, "base64");
+          const buffer =
+            result.type === "text"
+              ? Buffer.from(result.content)
+              : Buffer.from(result.content, "base64");
 
           writeFileSync(validation.resolved, buffer);
           return {
-            content: [{ type: "text" as const, text: `Downloaded: ${params.path} → ${validation.resolved} (${fmtSize(buffer.byteLength)})` }],
+            content: [
+              {
+                type: "text" as const,
+                text: `Downloaded: ${params.path} → ${validation.resolved} (${fmtSize(buffer.byteLength)})`,
+              },
+            ],
           };
         }
 
@@ -1020,14 +900,16 @@ function createServer(): McpServer {
         }
         // Binary — return as embedded resource with base64
         return {
-          content: [{
-            type: "resource" as const,
-            resource: {
-              uri: `nextcloud://${encodeURI(normalizePath(params.path))}`,
-              mimeType: result.mimeType,
-              blob: result.content,
+          content: [
+            {
+              type: "resource" as const,
+              resource: {
+                uri: `nextcloud://${encodeURI(normalizePath(params.path))}`,
+                mimeType: result.mimeType,
+                blob: result.content,
+              },
             },
-          }],
+          ],
         };
       } catch (e) {
         return {
@@ -1042,18 +924,10 @@ function createServer(): McpServer {
 
 // ── Rate Limiter ──────────────────────────────────────────
 
-const RATE_LIMIT = 30;
-const RATE_WINDOW_MS = 60_000;
 const requestTimestamps: number[] = [];
 
 function isRateLimited(): boolean {
-  const now = Date.now();
-  while (requestTimestamps.length > 0 && requestTimestamps[0] < now - RATE_WINDOW_MS) {
-    requestTimestamps.shift();
-  }
-  if (requestTimestamps.length >= RATE_LIMIT) return true;
-  requestTimestamps.push(now);
-  return false;
+  return isRateLimitedPure(requestTimestamps, Date.now(), RATE_LIMIT, RATE_WINDOW_MS);
 }
 
 // ── HTTP Server (stateless mode) ───────────────────────────
@@ -1071,7 +945,11 @@ const httpServer = Bun.serve({
         const check = await webdav("PROPFIND", "/", { Depth: "0" });
         const ok = check.status === 207 || check.ok;
         return new Response(
-          JSON.stringify({ status: ok ? "ok" : "degraded", service: "mcp-nextcloud", nextcloud: ok }),
+          JSON.stringify({
+            status: ok ? "ok" : "degraded",
+            service: "mcp-nextcloud",
+            nextcloud: ok,
+          }),
           { status: ok ? 200 : 503, headers: { "Content-Type": "application/json" } },
         );
       } catch {
@@ -1093,8 +971,8 @@ const httpServer = Bun.serve({
         }
 
         // Sanitize filename — strip path components, allow only safe characters
-        const clean = basename(filename).replace(/[^a-zA-Z0-9._-]/g, "_");
-        if (!clean || clean === "." || clean === "..") {
+        const clean = sanitizeReceivedFilename(filename);
+        if (!clean) {
           return new Response(JSON.stringify({ error: "Invalid filename" }), {
             status: 400,
             headers: { "Content-Type": "application/json" },
@@ -1120,7 +998,7 @@ const httpServer = Bun.serve({
         const dest = resolve(uploadDir, clean);
 
         // Final path traversal check
-        if (!dest.startsWith(uploadDir + "/")) {
+        if (!dest.startsWith(`${uploadDir}/`)) {
           return new Response(JSON.stringify({ error: "Path traversal rejected" }), {
             status: 400,
             headers: { "Content-Type": "application/json" },
@@ -1132,7 +1010,11 @@ const httpServer = Bun.serve({
         console.log(`[receive] Staged file: ${clean} (${sizeMB} MB)`);
 
         return new Response(
-          JSON.stringify({ staged: clean, size_bytes: body.byteLength, local_path: `/data/upload/${clean}` }),
+          JSON.stringify({
+            staged: clean,
+            size_bytes: body.byteLength,
+            local_path: `/data/upload/${clean}`,
+          }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       } catch (e) {

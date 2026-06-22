@@ -87,7 +87,7 @@ async function webdav(
   return fetch(url, {
     method,
     headers: { Authorization: AUTH_HEADER, ...headers },
-    body,
+    ...(body === undefined ? {} : { body }),
     signal: AbortSignal.timeout(30_000),
   });
 }
@@ -179,11 +179,61 @@ function validateLocalPath(
   }
 }
 
+/** Resolved upload payload, or an error message to return to the caller. */
+type UploadSource =
+  | { reqBody: BodyInit; contentType: string; fileSizeBytes: number; timeoutMs: number }
+  | { error: string };
+
+/** Resolve the request body, content type, size, and timeout from an upload's input source. */
+function resolveUploadSource(params: {
+  content?: string | undefined;
+  encoding: string;
+  local_path?: string | undefined;
+}): UploadSource {
+  if (params.local_path) {
+    const result = validateLocalPath(params.local_path);
+    if ("error" in result) return { error: result.error };
+
+    const file = Bun.file(result.resolved);
+    return {
+      reqBody: file,
+      fileSizeBytes: result.size,
+      contentType: file.type || "application/octet-stream",
+      // Scale timeout: base 30s + 1s per MB, capped at 300s
+      timeoutMs: Math.min(30_000 + Math.ceil(result.size / (1024 * 1024)) * 1_000, 300_000),
+    };
+  }
+
+  if (params.content) {
+    if (params.encoding === "base64") {
+      try {
+        const binary = atob(params.content);
+        return {
+          reqBody: new Blob([Uint8Array.from(binary, (c) => c.charCodeAt(0))]),
+          fileSizeBytes: binary.length,
+          contentType: "application/octet-stream",
+          timeoutMs: 30_000,
+        };
+      } catch {
+        return { error: "Invalid base64 content." };
+      }
+    }
+    return {
+      reqBody: params.content,
+      fileSizeBytes: new TextEncoder().encode(params.content).length,
+      contentType: "text/plain; charset=utf-8",
+      timeoutMs: 30_000,
+    };
+  }
+
+  return { error: "Provide either content (inline data) or local_path (file on disk)." };
+}
+
 async function upload(params: {
   path: string;
-  content?: string;
+  content?: string | undefined;
   encoding: string;
-  local_path?: string;
+  local_path?: string | undefined;
 }): Promise<string> {
   const err = validatePath(params.path);
   if (err) return `Error: ${err}`;
@@ -193,38 +243,9 @@ async function upload(params: {
     return "Error: Provide either local_path or content, not both. Use local_path for files on disk, content for inline data.";
   }
 
-  let contentType = "application/octet-stream";
-  let reqBody: BodyInit;
-  let fileSizeBytes = 0;
-  let timeoutMs = 30_000; // default for inline content
-
-  if (params.local_path) {
-    const result = validateLocalPath(params.local_path);
-    if ("error" in result) return `Error: ${result.error}`;
-
-    const file = Bun.file(result.resolved);
-    reqBody = file;
-    fileSizeBytes = result.size;
-    contentType = file.type || "application/octet-stream";
-    // Scale timeout: base 30s + 1s per MB, capped at 300s
-    timeoutMs = Math.min(30_000 + Math.ceil(result.size / (1024 * 1024)) * 1_000, 300_000);
-  } else if (params.content) {
-    if (params.encoding === "base64") {
-      try {
-        const binary = atob(params.content);
-        reqBody = new Blob([Uint8Array.from(binary, (c) => c.charCodeAt(0))]);
-        fileSizeBytes = binary.length;
-      } catch {
-        return "Error: Invalid base64 content.";
-      }
-    } else {
-      reqBody = params.content;
-      fileSizeBytes = new TextEncoder().encode(params.content).length;
-      contentType = "text/plain; charset=utf-8";
-    }
-  } else {
-    return "Error: Provide either content (inline data) or local_path (file on disk).";
-  }
+  const source = resolveUploadSource(params);
+  if ("error" in source) return `Error: ${source.error}`;
+  const { reqBody, contentType, fileSizeBytes, timeoutMs } = source;
 
   const sizeStr =
     fileSizeBytes >= 1e6
@@ -412,11 +433,49 @@ async function search(params: { query: string; path: string; limit: number }): P
 
 const OCS_SHARE_BASE = `${creds.server.replace(/\/+$/, "")}/ocs/v2.php/apps/files_sharing/api/v1`;
 
+// OCS responses are untyped JSON from NextCloud. Model them as a recursive
+// JSON value so callers can navigate without `any`.
+type OcsJson =
+  | string
+  | number
+  | boolean
+  | null
+  | undefined
+  | OcsJson[]
+  | { [key: string]: OcsJson };
+
+/** Read a property from an OCS JSON value, returning undefined for non-objects. */
+function ocsProp(value: OcsJson, key: string): OcsJson {
+  if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+    return value[key];
+  }
+  return undefined;
+}
+
+type Sharee = { label: string; value: { shareWith: string } };
+
+/** Coerce an OCS JSON value into the sharee list shape, skipping malformed entries. */
+function toSharees(value: OcsJson): Sharee[] {
+  if (!Array.isArray(value)) return [];
+  const result: Sharee[] = [];
+  for (const entry of value) {
+    const shareWith = ocsProp(ocsProp(entry, "value"), "shareWith");
+    const label = ocsProp(entry, "label");
+    if (typeof shareWith === "string") {
+      result.push({
+        label: typeof label === "string" ? label : "",
+        value: { shareWith },
+      });
+    }
+  }
+  return result;
+}
+
 async function ocsGet(
   baseUrl: string,
   endpoint: string,
   params: Record<string, string> = {},
-): Promise<{ status: number; data: any; meta: any }> {
+): Promise<{ status: number; data: OcsJson; meta: OcsJson }> {
   const qs = new URLSearchParams(params);
   const sep = endpoint.includes("?") ? "&" : "?";
   const url = `${baseUrl}${endpoint}${qs.toString() ? sep + qs.toString() : ""}`;
@@ -429,11 +488,12 @@ async function ocsGet(
     },
     signal: AbortSignal.timeout(15_000),
   });
-  const json = await res.json();
+  const json = (await res.json()) as OcsJson;
+  const ocs = ocsProp(json, "ocs");
   return {
     status: res.status,
-    data: json?.ocs?.data ?? json,
-    meta: json?.ocs?.meta ?? {},
+    data: ocsProp(ocs, "data") ?? json,
+    meta: ocsProp(ocs, "meta") ?? {},
   };
 }
 
@@ -442,7 +502,7 @@ const OCS_BASE = OCS_SHARE_BASE;
 async function ocsPost(
   endpoint: string,
   body: Record<string, string | number>,
-): Promise<{ status: number; data: any }> {
+): Promise<{ status: number; data: OcsJson }> {
   const res = await fetch(`${OCS_BASE}${endpoint}`, {
     method: "POST",
     headers: {
@@ -454,8 +514,8 @@ async function ocsPost(
     body: new URLSearchParams(Object.entries(body).map(([k, v]) => [k, String(v)])),
     signal: AbortSignal.timeout(15_000),
   });
-  const json = await res.json();
-  return { status: res.status, data: json?.ocs?.data ?? json };
+  const json = (await res.json()) as OcsJson;
+  return { status: res.status, data: ocsProp(ocsProp(json, "ocs"), "data") ?? json };
 }
 
 // ── Tool: nextcloud-list-users (via Sharees API — no admin required) ──
@@ -489,15 +549,16 @@ async function listUsers(params: { search: string; limit: number }): Promise<str
       return `List users failed (HTTP ${status})`;
     }
 
-    const users: Array<{ label: string; value: { shareWith: string } }> =
-      data?.users ?? data?.exact?.users ?? [];
-    const exact: Array<{ label: string; value: { shareWith: string } }> = data?.exact?.users ?? [];
+    const exactUsers = ocsProp(ocsProp(data, "exact"), "users");
+    const directUsers = ocsProp(data, "users");
+    const users = toSharees(directUsers ?? exactUsers);
+    const exact = toSharees(exactUsers);
     const all = [...exact, ...users];
 
     // Deduplicate by shareWith
     const seen = new Set<string>();
     const unique = all.filter((u) => {
-      const id = u?.value?.shareWith;
+      const id = u.value.shareWith;
       if (!id || seen.has(id)) return false;
       seen.add(id);
       return true;
@@ -557,14 +618,17 @@ async function share(params: {
     });
 
     if (status === 200) {
-      const shareId = data?.id ?? "unknown";
+      const id = ocsProp(data, "id");
+      const shareId = id === undefined || id === null ? "unknown" : id;
       return `Shared "${params.path}" with ${params.shareWith} (${params.permissions}). Share ID: ${shareId}`;
     }
     if (status === 404) return `Error: Path not found — "${params.path}"`;
     if (status === 403) return `Error: Insufficient permissions to share this path.`;
 
-    const msg = data?.message || data?.meta?.message || "";
-    if (msg) return `Share failed (${status}): ${sanitizeOutput(msg)}`;
+    const directMsg = ocsProp(data, "message");
+    const metaMsg = ocsProp(ocsProp(data, "meta"), "message");
+    const msg = typeof directMsg === "string" && directMsg ? directMsg : metaMsg;
+    if (typeof msg === "string" && msg) return `Share failed (${status}): ${sanitizeOutput(msg)}`;
     return `Share failed (${status})`;
   } catch {
     return "Share failed — NextCloud request error.";
@@ -932,6 +996,77 @@ function isRateLimited(): boolean {
 
 // ── HTTP Server (stateless mode) ───────────────────────────
 
+const JSON_HEADERS = { "Content-Type": "application/json" } as const;
+
+/** Build a JSON Response with the standard content-type header. */
+function jsonResponse(payload: unknown, status: number): Response {
+  return new Response(JSON.stringify(payload), { status, headers: JSON_HEADERS });
+}
+
+async function handleHealth(): Promise<Response> {
+  try {
+    const check = await webdav("PROPFIND", "/", { Depth: "0" });
+    const ok = check.status === 207 || check.ok;
+    return jsonResponse(
+      { status: ok ? "ok" : "degraded", service: "mcp-nextcloud", nextcloud: ok },
+      ok ? 200 : 503,
+    );
+  } catch {
+    return jsonResponse({ status: "degraded", service: "mcp-nextcloud", nextcloud: false }, 503);
+  }
+}
+
+async function handleReceive(req: Request, url: URL): Promise<Response> {
+  try {
+    const filename = url.searchParams.get("filename");
+    if (!filename) return jsonResponse({ error: "Missing ?filename= parameter" }, 400);
+
+    // Sanitize filename — strip path components, allow only safe characters
+    const clean = sanitizeReceivedFilename(filename);
+    if (!clean) return jsonResponse({ error: "Invalid filename" }, 400);
+
+    const body = await req.arrayBuffer();
+    if (body.byteLength === 0) return jsonResponse({ error: "Empty body" }, 400);
+    if (body.byteLength > 50 * 1024 * 1024) {
+      return jsonResponse({ error: "File too large (max 50MB)" }, 413);
+    }
+
+    const uploadDir = "/data/upload";
+    mkdirSync(uploadDir, { recursive: true });
+    const dest = resolve(uploadDir, clean);
+
+    // Final path traversal check
+    if (!dest.startsWith(`${uploadDir}/`)) {
+      return jsonResponse({ error: "Path traversal rejected" }, 400);
+    }
+
+    writeFileSync(dest, Buffer.from(body));
+    const sizeMB = (body.byteLength / 1_048_576).toFixed(2);
+    console.log(`[receive] Staged file: ${clean} (${sizeMB} MB)`);
+
+    return jsonResponse(
+      { staged: clean, size_bytes: body.byteLength, local_path: `/data/upload/${clean}` },
+      200,
+    );
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "unknown error";
+    console.error(`[receive] Error: ${msg}`);
+    return jsonResponse({ error: "Internal error" }, 500);
+  }
+}
+
+async function handleMcp(req: Request): Promise<Response> {
+  if (isRateLimited()) {
+    return new Response("Rate limit exceeded", { status: 429 });
+  }
+  const server = createServer();
+  // Stateless mode: omitting sessionIdGenerator disables session management
+  // (a fresh transport is created per request).
+  const transport = new WebStandardStreamableHTTPServerTransport({});
+  await server.connect(transport);
+  return transport.handleRequest(req);
+}
+
 // Per the MCP SDK stateless pattern, a new server instance is created per
 // request so that .connect() is only called once per McpServer lifetime.
 const httpServer = Bun.serve({
@@ -940,104 +1075,9 @@ const httpServer = Bun.serve({
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
 
-    if (url.pathname === "/health") {
-      try {
-        const check = await webdav("PROPFIND", "/", { Depth: "0" });
-        const ok = check.status === 207 || check.ok;
-        return new Response(
-          JSON.stringify({
-            status: ok ? "ok" : "degraded",
-            service: "mcp-nextcloud",
-            nextcloud: ok,
-          }),
-          { status: ok ? 200 : 503, headers: { "Content-Type": "application/json" } },
-        );
-      } catch {
-        return new Response(
-          JSON.stringify({ status: "degraded", service: "mcp-nextcloud", nextcloud: false }),
-          { status: 503, headers: { "Content-Type": "application/json" } },
-        );
-      }
-    }
-
-    if (url.pathname === "/receive" && req.method === "POST") {
-      try {
-        const filename = url.searchParams.get("filename");
-        if (!filename) {
-          return new Response(JSON.stringify({ error: "Missing ?filename= parameter" }), {
-            status: 400,
-            headers: { "Content-Type": "application/json" },
-          });
-        }
-
-        // Sanitize filename — strip path components, allow only safe characters
-        const clean = sanitizeReceivedFilename(filename);
-        if (!clean) {
-          return new Response(JSON.stringify({ error: "Invalid filename" }), {
-            status: 400,
-            headers: { "Content-Type": "application/json" },
-          });
-        }
-
-        const body = await req.arrayBuffer();
-        if (body.byteLength === 0) {
-          return new Response(JSON.stringify({ error: "Empty body" }), {
-            status: 400,
-            headers: { "Content-Type": "application/json" },
-          });
-        }
-        if (body.byteLength > 50 * 1024 * 1024) {
-          return new Response(JSON.stringify({ error: "File too large (max 50MB)" }), {
-            status: 413,
-            headers: { "Content-Type": "application/json" },
-          });
-        }
-
-        const uploadDir = "/data/upload";
-        mkdirSync(uploadDir, { recursive: true });
-        const dest = resolve(uploadDir, clean);
-
-        // Final path traversal check
-        if (!dest.startsWith(`${uploadDir}/`)) {
-          return new Response(JSON.stringify({ error: "Path traversal rejected" }), {
-            status: 400,
-            headers: { "Content-Type": "application/json" },
-          });
-        }
-
-        writeFileSync(dest, Buffer.from(body));
-        const sizeMB = (body.byteLength / 1_048_576).toFixed(2);
-        console.log(`[receive] Staged file: ${clean} (${sizeMB} MB)`);
-
-        return new Response(
-          JSON.stringify({
-            staged: clean,
-            size_bytes: body.byteLength,
-            local_path: `/data/upload/${clean}`,
-          }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        );
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : "unknown error";
-        console.error(`[receive] Error: ${msg}`);
-        return new Response(JSON.stringify({ error: "Internal error" }), {
-          status: 500,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-    }
-
-    if (url.pathname === "/mcp") {
-      if (isRateLimited()) {
-        return new Response("Rate limit exceeded", { status: 429 });
-      }
-      const server = createServer();
-      const transport = new WebStandardStreamableHTTPServerTransport({
-        sessionIdGenerator: undefined,
-      });
-      await server.connect(transport);
-      return transport.handleRequest(req);
-    }
+    if (url.pathname === "/health") return handleHealth();
+    if (url.pathname === "/receive" && req.method === "POST") return handleReceive(req, url);
+    if (url.pathname === "/mcp") return handleMcp(req);
 
     return new Response("Not Found", { status: 404 });
   },

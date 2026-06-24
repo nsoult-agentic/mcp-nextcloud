@@ -298,7 +298,8 @@ async function list(params: { path: string }): Promise<string> {
 
     entries.sort((a, b) => {
       if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
-      return a.name.localeCompare(b.name);
+      // Code-point ordering, not localeCompare: deterministic across hosts (this listing feeds an LLM, not a localized UI).
+      return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
     });
 
     const lines = [`## ${params.path || "/"}`, ""];

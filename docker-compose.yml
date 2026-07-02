@@ -11,6 +11,8 @@ services:
   mcp-nextcloud:
     image: ghcr.io/nsoult-agentic/mcp-nextcloud:sha-0054f40
     container_name: mcp-nextcloud
+    labels:
+      - "diun.enable=false"  # our own CI/sha-built image; diun watches third-party only (brain #2538)
     restart: unless-stopped
 
     # ── Network ──
